@@ -1,25 +1,24 @@
 [
-    {
-        "name": "esbuild enables any website to send any requests to the development server and read the response",
-        "package": "esbuild",
-        "version": "unknown",
-        "severity": "moderate",
-        "fixed_in": "8.0.8",
-        "url": "https://github.com/advisories/GHSA-67mh-4wv8-2f99"
-    },
-    {
-        "name": "Vite Vulnerable to Path Traversal in Optimized Deps `.map` Handling",
-        "package": "vite",
-        "version": "unknown",
-        "severity": "moderate",
-        "fixed_in": "8.0.8",
-        "url": "https://github.com/advisories/GHSA-4w7w-66w2-5vf9"
-    },
-    {
-        "name": "esbuild",
-        "package": "vite",
-        "version": "unknown",
-        "severity": "moderate",
-        "fixed_in": "8.0.8"
-    }
+  {
+    "id": "1102341",
+    "name": "esbuild enables any website to send any requests to the development server and read the response",
+    "package": "esbuild",
+    "version": "<=0.24.2",
+    "severity": "moderate",
+    "fixed_in": "8.0.8",
+    "fix_available": true,
+    "description": "esbuild enables any website to send any requests to the development server and read the response",
+    "url": "https://github.com/advisories/GHSA-67mh-4wv8-2f99"
+  },
+  {
+    "id": "1116229",
+    "name": "Vite Vulnerable to Path Traversal in Optimized Deps `.map` Handling",
+    "package": "vite",
+    "version": "<=6.4.1",
+    "severity": "moderate",
+    "fixed_in": "8.0.8",
+    "fix_available": true,
+    "description": "Vite Vulnerable to Path Traversal in Optimized Deps `.map` Handling",
+    "url": "https://github.com/advisories/GHSA-4w7w-66w2-5vf9"
+  }
 ]
