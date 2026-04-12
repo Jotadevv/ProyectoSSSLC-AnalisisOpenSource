@@ -1,0 +1,44 @@
+{
+    "total_vulnerabilities": 4,
+    "vulnerabilities": [
+        {
+            "name": "CVE-2026-27205",
+            "package": "flask",
+            "version": "3.0.3",
+            "severity": "unknown",
+            "fixed_in": "3.1.3",
+            "description": "When the `session` object is accessed, Flask should set the `Vary: Cookie` header. This instructs caches not to cache the response, as it may contain information specific to a logged in user. This is handled in most cases, but some forms of access such as the Python `in` operator were overlooked.  The severity depends on the application's use of the session, and the cache's behavior regarding cookies. The risk depends on all these conditions being met.  1. The application must be hosted behind a caching proxy that does not ignore responses with cookies. 2. The application does not set a `Cache-Control` header to indicate that a page is private or should not be cached. 3. The application accesses the session in a way that does not access the values, only the keys, and does not mutate the session.",
+            "ecosystem": "Python"
+        },
+        {
+            "name": "esbuild enables any website to send any requests to the development server and read the response",
+            "package": "esbuild",
+            "version": "unknown",
+            "severity": "moderate",
+            "fixed_in": "8.0.8",
+            "url": "https://github.com/advisories/GHSA-67mh-4wv8-2f99",
+            "ecosystem": "Node.js"
+        },
+        {
+            "name": "Vite Vulnerable to Path Traversal in Optimized Deps `.map` Handling",
+            "package": "vite",
+            "version": "unknown",
+            "severity": "moderate",
+            "fixed_in": "8.0.8",
+            "url": "https://github.com/advisories/GHSA-4w7w-66w2-5vf9",
+            "ecosystem": "Node.js"
+        },
+        {
+            "name": "esbuild",
+            "package": "vite",
+            "version": "unknown",
+            "severity": "moderate",
+            "fixed_in": "8.0.8",
+            "ecosystem": "Node.js"
+        }
+    ],
+    "summary": {
+        "Python": 1,
+        "Node.js": 3
+    }
+}

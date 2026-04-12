@@ -5,10 +5,12 @@ import sys
 
 def run_npm_audit():
     print("1. Verificando npm")
+    npm_cmd = r"C:\Program Files\nodejs\npm.cmd"
     try:
-        subprocess.run(["npm", "--version"], check=True, capture_output=True)
-    except subprocess.CalledProcessError:
-        print("Error: npm no está instalado")
+        subprocess.run([npm_cmd, "--version"], check=True, capture_output=True)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        print("Error: npm no está instalado o no se encuentra en la ruta esperada")
+        print("Verifica que Node.js esté instalado correctamente")
         return False
     
     print("2. Verificando package.json")
@@ -20,16 +22,25 @@ def run_npm_audit():
     if os.path.exists("node_modules"):
         print("node_modules ya existe, saltando instalación")
     else:
-        subprocess.run(["npm", "install"], check=True)
+        try:
+            subprocess.run([npm_cmd, "install"], check=True)
+            print("Dependencias instaladas correctamente")
+        except (subprocess.CalledProcessError, FileNotFoundError) as e:
+            print(f"Error instalando dependencias: {e}")
+            return False
     
     print("4. Ejecutando npm audit y generando archivo")
     try:
-        with open("npm_output.txt", "w") as f:
-            subprocess.run(["npm", "audit", "--json"], stdout=f, stderr=subprocess.STDOUT)
+        with open("npm_output.txt", "w", encoding="utf-8") as f:
+            result = subprocess.run([npm_cmd, "audit", "--json"], 
+                                  stdout=f, stderr=subprocess.STDOUT, 
+                                  text=True)
+        # npm audit puede retornar código de error incluso si funciona
+        print(f"npm audit completado con código {result.returncode}")
         return True
-    except subprocess.CalledProcessError as e:
-        print(f"npm audit completado con código {e.returncode} (normal si hay vulnerabilidades)")
-        return True
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        print(f"Error ejecutando npm audit: {e}")
+        return False
 
 def parse_npm_audit_to_json(file_path):
     print("5. Parseando resultados de npm audit a JSON")
@@ -39,7 +50,7 @@ def parse_npm_audit_to_json(file_path):
         return
     
     try:
-        with open(file_path, "r") as f:
+        with open(file_path, "r", encoding="utf-8") as f:
             content = f.read()
         
         if not content.strip():
@@ -52,36 +63,54 @@ def parse_npm_audit_to_json(file_path):
         # Procesar vulnerabilidades del npm audit
         if "vulnerabilities" in audit_data:
             for pkg_name, pkg_data in audit_data["vulnerabilities"].items():
-                if "via" in pkg_data and pkg_data["via"]:
-                    for via_item in pkg_data["via"]:
-                        if isinstance(via_item, dict):
-                            vulnerability = {
-                                "package": pkg_name,
-                                "version": pkg_data.get("version", "unknown"),
-                                "severity": pkg_data.get("severity", "unknown"),
-                                "title": via_item.get("title", "N/A"),
-                                "cve": via_item.get("cve", []),
-                                "cvss_score": via_item.get("cvss", {}).get("score", "N/A"),
-                                "url": via_item.get("url", "N/A"),
-                                "fixed_in": pkg_data.get("fixAvailable", False)
-                            }
-                            if vulnerability["fixed_in"] and isinstance(vulnerability["fixed_in"], dict):
-                                vulnerability["fixed_in"] = vulnerability["fixed_in"].get("version", "unknown")
-                            results.append(vulnerability)
-                        elif isinstance(via_item, str):
-                            vulnerability = {
-                                "package": pkg_name,
-                                "version": pkg_data.get("version", "unknown"),
-                                "severity": pkg_data.get("severity", "unknown"),
-                                "advisory": via_item,
-                                "fixed_in": pkg_data.get("fixAvailable", False)
-                            }
-                            if vulnerability["fixed_in"] and isinstance(vulnerability["fixed_in"], dict):
-                                vulnerability["fixed_in"] = vulnerability["fixed_in"].get("version", "unknown")
-                            results.append(vulnerability)
+                severity = pkg_data.get("severity", "unknown")
+                version = pkg_data.get("version", "unknown")
+                
+                # Determinar si hay fix disponible
+                fix_available = pkg_data.get("fixAvailable", False)
+                if isinstance(fix_available, dict):
+                    fixed_version = fix_available.get("version", "Disponible")
+                elif fix_available is True:
+                    fixed_version = "Disponible"
+                else:
+                    fixed_version = "No disponible"
+                
+                # Procesar la información de 'via'
+                via_info = pkg_data.get("via", [])
+                if not isinstance(via_info, list):
+                    via_info = [via_info]
+                
+                for via_item in via_info:
+                    if isinstance(via_item, dict):
+                        # Es un objeto con información detallada
+                        vuln_name = via_item.get("title", via_item.get("name", pkg_name))
+                        vuln_url = via_item.get("url", "")
+                        vuln_severity = via_item.get("severity", severity)
+                        
+                        vulnerability = {
+                            "name": vuln_name,
+                            "package": pkg_name,
+                            "version": version,
+                            "severity": vuln_severity,
+                            "fixed_in": fixed_version,
+                            "url": vuln_url
+                        }
+                    elif isinstance(via_item, str):
+                        # Es solo un string con el nombre de la dependencia
+                        vulnerability = {
+                            "name": via_item,
+                            "package": pkg_name,
+                            "version": version,
+                            "severity": severity,
+                            "fixed_in": fixed_version
+                        }
+                    else:
+                        continue
+                    
+                    results.append(vulnerability)
         
         # Guardar resultados procesados
-        with open("npm_audit_results.json", "w") as json_file:
+        with open("npm_audit_results.json", "w", encoding="utf-8") as json_file:
             json.dump(results, json_file, indent=4)
         
         print(f"Se han procesado {len(results)} vulnerabilidades en 'npm_audit_results.json'")
@@ -99,7 +128,7 @@ def parse_npm_audit_to_json(file_path):
     except json.JSONDecodeError as e:
         print(f"Error al parsear JSON: {e}")
         print("Contenido del archivo:")
-        with open(file_path, "r") as f:
+        with open(file_path, "r", encoding="utf-8") as f:
             print(f.read()[:500])
     except Exception as e:
         print(f"Error inesperado: {e}")
