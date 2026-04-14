@@ -1,7 +1,6 @@
 # Name of this GitHub Actions workflow.
 name: Semgrep CE scan
 
-
 on:
   # Scan in PRs:
   pull_request: {}
@@ -11,6 +10,9 @@ on:
   push:
     branches: ["master", "main"]
   # Schedule the CI job (this method uses cron syntax):
+  schedule:
+    - cron: '20 17 * * *' # Sets Semgrep to scan every day at 17:20 UTC.
+    # It is recommended to change the schedule to a random time.
 
 permissions:
   contents: read
