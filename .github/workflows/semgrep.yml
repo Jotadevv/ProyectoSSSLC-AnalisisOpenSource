@@ -1,6 +1,7 @@
 # Name of this GitHub Actions workflow.
 name: Semgrep CE scan
 
+
 on:
   # Scan in PRs:
   pull_request: {}
