@@ -328,6 +328,40 @@ def _parse_npm_audit(raw_output: dict[str, Any]) -> tuple[list[dict[str, Any]], 
     return _sorted_vulnerabilities(vulnerabilities), dependencies_scanned
 
 
+def _requirements_are_exact_pins(requirements_text: str) -> bool:
+    has_packages = False
+
+    for raw_line in requirements_text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith(("-", "--")):
+            return False
+
+        requirement = line.split(" #", 1)[0].strip()
+        if "==" not in requirement:
+            return False
+        has_packages = True
+
+    return has_packages
+
+
+def _parse_pip_audit_stdout(stdout: str) -> dict[str, Any] | None:
+    if not (stdout or "").strip():
+        return None
+
+    try:
+        parsed = _parse_json_payload(stdout)
+    except json.JSONDecodeError:
+        return None
+
+    dependencies = parsed.get("dependencies") if isinstance(parsed, dict) else None
+    if not isinstance(dependencies, list):
+        return None
+
+    return parsed
+
+
 def _run_python_audit(requirements_text: str) -> tuple[dict[str, Any], dict[str, Any]]:
     _ensure_pip_audit()
 
@@ -336,28 +370,51 @@ def _run_python_audit(requirements_text: str) -> tuple[dict[str, Any], dict[str,
         with open(requirements_path, "w", encoding="utf-8") as req_file:
             req_file.write(requirements_text)
 
+        base_cmd = [
+            sys.executable,
+            "-m",
+            "pip_audit",
+            "--format",
+            "json",
+            "--requirement",
+            requirements_path,
+        ]
+        used_fallback_mode = False
+
         started = time.perf_counter()
-        result = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "pip_audit",
-                "--format",
-                "json",
-                "--requirement",
-                requirements_path,
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=COMMAND_TIMEOUT_SECONDS,
-        )
+        result = subprocess.run(base_cmd, capture_output=True, text=True, check=False, timeout=COMMAND_TIMEOUT_SECONDS)
+        raw = _parse_pip_audit_stdout(result.stdout)
+        run_is_usable = result.returncode in (0, 1) and raw is not None
+
+        if not run_is_usable and _requirements_are_exact_pins(requirements_text):
+            # Fallback for legacy pinned dependencies that fail while pip tries to build/resolve.
+            fallback_cmd = [*base_cmd, "--no-deps", "--disable-pip"]
+            fallback_result = subprocess.run(
+                fallback_cmd,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=COMMAND_TIMEOUT_SECONDS,
+            )
+            fallback_raw = _parse_pip_audit_stdout(fallback_result.stdout)
+            fallback_is_usable = fallback_result.returncode in (0, 1) and fallback_raw is not None
+
+            if fallback_is_usable:
+                result = fallback_result
+                raw = fallback_raw
+                used_fallback_mode = True
+            else:
+                primary_error = result.stderr.strip() or "Error ejecutando pip-audit"
+                fallback_error = fallback_result.stderr.strip() or "Error en fallback de pip-audit"
+                raise RuntimeError(f"{primary_error}\nFallback (--no-deps --disable-pip): {fallback_error}")
+
         duration_ms = int((time.perf_counter() - started) * 1000)
 
     if result.returncode not in (0, 1):
         raise RuntimeError(result.stderr.strip() or "Error ejecutando pip-audit")
+    if raw is None:
+        raise RuntimeError(result.stderr.strip() or "No se pudo interpretar la salida JSON de pip-audit")
 
-    raw = _parse_json_payload(result.stdout)
     vulnerabilities, dependencies_scanned = _parse_python_audit(raw)
     summary = _build_summary(vulnerabilities, dependencies_scanned)
 
@@ -367,6 +424,7 @@ def _run_python_audit(requirements_text: str) -> tuple[dict[str, Any], dict[str,
         "duration_ms": duration_ms,
         "summary": summary,
         "vulnerabilities": vulnerabilities,
+        "audit_mode": "pinned-no-deps" if used_fallback_mode else "resolved-with-pip",
     }
 
     return payload, raw

@@ -3,6 +3,37 @@ import json
 import os
 import sys
 
+def requirements_are_exact_pins(requirements_text: str) -> bool:
+    has_packages = False
+
+    for raw_line in requirements_text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith(("-", "--")):
+            return False
+
+        requirement = line.split(" #", 1)[0].strip()
+        if "==" not in requirement:
+            return False
+        has_packages = True
+
+    return has_packages
+
+
+def has_valid_pip_audit_json(stdout: str) -> bool:
+    text = (stdout or "").strip()
+    if not text:
+        return False
+
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return False
+
+    return isinstance(payload, dict) and isinstance(payload.get("dependencies"), list)
+
+
 def run_audit():
     print("--- 1. Verificando pip-audit ---")
     try:
@@ -19,17 +50,33 @@ def run_audit():
         print("Error: No se encontró requirements.txt")
         return False
 
-    result = subprocess.run(
-        [sys.executable, "-m", "pip_audit", "--format", "json", "--requirement", requirements_path],
-        capture_output=True,
-        text=True,
-    )
+    with open(requirements_path, "r", encoding="utf-8") as req_file:
+        requirements_text = req_file.read()
+
+    base_cmd = [sys.executable, "-m", "pip_audit", "--format", "json", "--requirement", requirements_path]
+    result = subprocess.run(base_cmd, capture_output=True, text=True)
+    run_is_usable = result.returncode in (0, 1) and has_valid_pip_audit_json(result.stdout)
+
+    if not run_is_usable and requirements_are_exact_pins(requirements_text):
+        print("Fallo resolviendo dependencias; reintentando en modo pinned (--no-deps --disable-pip)")
+        fallback_cmd = [*base_cmd, "--no-deps", "--disable-pip"]
+        fallback_result = subprocess.run(fallback_cmd, capture_output=True, text=True)
+        fallback_is_usable = fallback_result.returncode in (0, 1) and has_valid_pip_audit_json(
+            fallback_result.stdout
+        )
+        if fallback_is_usable:
+            result = fallback_result
+        else:
+            print("Error en fallback:", fallback_result.stderr)
 
     with open("python_output.json", "w", encoding="utf-8") as f:
         f.write(result.stdout)
 
     if result.returncode not in (0, 1):
         print("Error al ejecutar pip-audit:", result.stderr)
+        return False
+    if not has_valid_pip_audit_json(result.stdout):
+        print("Error: pip-audit no devolvió JSON válido.", result.stderr)
         return False
 
     return True
