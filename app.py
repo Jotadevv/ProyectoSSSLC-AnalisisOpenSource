@@ -379,41 +379,56 @@ def _run_python_audit(requirements_text: str) -> tuple[dict[str, Any], dict[str,
             "--requirement",
             requirements_path,
         ]
-        used_fallback_mode = False
+        no_deps_cmd = [*base_cmd, "--no-deps", "--disable-pip"]
+        exact_pins = _requirements_are_exact_pins(requirements_text)
+        used_no_deps_mode = False
 
         started = time.perf_counter()
-        result = subprocess.run(base_cmd, capture_output=True, text=True, check=False, timeout=COMMAND_TIMEOUT_SECONDS)
-        raw = _parse_pip_audit_stdout(result.stdout)
-        run_is_usable = result.returncode in (0, 1) and raw is not None
+        result: subprocess.CompletedProcess[str] | None = None
+        raw: dict[str, Any] | None = None
+        errors: list[str] = []
 
-        if not run_is_usable and _requirements_are_exact_pins(requirements_text):
-            # Fallback for legacy pinned dependencies that fail while pip tries to build/resolve.
-            fallback_cmd = [*base_cmd, "--no-deps", "--disable-pip"]
-            fallback_result = subprocess.run(
-                fallback_cmd,
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=COMMAND_TIMEOUT_SECONDS,
-            )
-            fallback_raw = _parse_pip_audit_stdout(fallback_result.stdout)
-            fallback_is_usable = fallback_result.returncode in (0, 1) and fallback_raw is not None
+        # For fully pinned requirements, prefer the fast path and avoid expensive resolution/build.
+        if exact_pins:
+            command_plan = [
+                ("modo rapido (--no-deps --disable-pip)", no_deps_cmd, True),
+                ("modo completo (resolviendo con pip)", base_cmd, False),
+            ]
+        else:
+            command_plan = [
+                ("modo completo (resolviendo con pip)", base_cmd, False),
+                ("modo rapido (--no-deps --disable-pip)", no_deps_cmd, True),
+            ]
 
-            if fallback_is_usable:
-                result = fallback_result
-                raw = fallback_raw
-                used_fallback_mode = True
-            else:
-                primary_error = result.stderr.strip() or "Error ejecutando pip-audit"
-                fallback_error = fallback_result.stderr.strip() or "Error en fallback de pip-audit"
-                raise RuntimeError(f"{primary_error}\nFallback (--no-deps --disable-pip): {fallback_error}")
+        for label, cmd, is_no_deps in command_plan:
+            try:
+                current_result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=COMMAND_TIMEOUT_SECONDS,
+                )
+            except subprocess.TimeoutExpired:
+                errors.append(f"{label} excedio el timeout de {COMMAND_TIMEOUT_SECONDS}s")
+                continue
+
+            current_raw = _parse_pip_audit_stdout(current_result.stdout)
+            run_is_usable = current_result.returncode in (0, 1) and current_raw is not None
+            if run_is_usable:
+                result = current_result
+                raw = current_raw
+                used_no_deps_mode = is_no_deps
+                break
+
+            error_detail = current_result.stderr.strip() or f"{label} no devolvio JSON valido"
+            errors.append(f"{label}: {error_detail}")
 
         duration_ms = int((time.perf_counter() - started) * 1000)
 
-    if result.returncode not in (0, 1):
-        raise RuntimeError(result.stderr.strip() or "Error ejecutando pip-audit")
-    if raw is None:
-        raise RuntimeError(result.stderr.strip() or "No se pudo interpretar la salida JSON de pip-audit")
+    if result is None or raw is None:
+        details = "\n".join(errors) if errors else "Error ejecutando pip-audit"
+        raise RuntimeError(details)
 
     vulnerabilities, dependencies_scanned = _parse_python_audit(raw)
     summary = _build_summary(vulnerabilities, dependencies_scanned)
@@ -424,7 +439,11 @@ def _run_python_audit(requirements_text: str) -> tuple[dict[str, Any], dict[str,
         "duration_ms": duration_ms,
         "summary": summary,
         "vulnerabilities": vulnerabilities,
-        "audit_mode": "pinned-no-deps" if used_fallback_mode else "resolved-with-pip",
+        "audit_mode": (
+            "pinned-no-deps"
+            if used_no_deps_mode and exact_pins
+            else "no-deps-fallback" if used_no_deps_mode else "resolved-with-pip"
+        ),
     }
 
     return payload, raw
