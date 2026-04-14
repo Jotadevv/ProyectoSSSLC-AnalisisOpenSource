@@ -1,12 +1,19 @@
 # Name of this GitHub Actions workflow.
 name: Semgrep CE scan
 
-
 on:
   # Scan in PRs:
   pull_request: {}
   # Scan on-demand through GitHub Actions interface:
   workflow_dispatch: {}
+  # Scan mainline branches and report all findings:
+  push:
+    branches: ["master", "main"]
+  # Schedule the CI job (this method uses cron syntax):
+  schedule:
+    - cron: '20 17 * * *' # Sets Semgrep to scan every day at 17:20 UTC.
+    # It is recommended to change the schedule to a random time.
+
 permissions:
   contents: read
 
@@ -35,18 +42,15 @@ jobs:
     steps:
       - name: git checkout
         uses: actions/checkout@v4
-        
-      - name: Set up Python
+      - name: setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
       - name: Install deps
         run: |
-          python -m pip install --upgrade pip 
-          pip install detect-secrets
-
+            python -m pip install -- upgrade-pip
+            pip install detect-secrets
       - name: Detect secrets
         run: |
-          detect-secrets scan > .secrets.baseline
-          cat .secrets.baseline
+            detect-secrets scan > .secrets.baseline
+            cat .secrets.baseline
