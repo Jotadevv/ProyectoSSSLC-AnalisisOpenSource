@@ -207,7 +207,7 @@ body {
 
 .metric-grid {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: 0.8rem;
 }
 
@@ -344,6 +344,64 @@ body {
   margin-top: 1rem;
 }
 
+.recommendations-card {
+  padding: 1.1rem;
+}
+
+.recommendations-list {
+  margin-top: 0.9rem;
+  display: grid;
+  gap: 0.7rem;
+}
+
+.rec-card {
+  border: 1px solid rgba(127, 159, 194, 0.24);
+  background: linear-gradient(145deg, rgba(11, 29, 46, 0.92), rgba(8, 22, 36, 0.94));
+  border-radius: 15px;
+  padding: 0.9rem;
+}
+
+.rec-top {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.8rem;
+  align-items: flex-start;
+}
+
+.rec-top h4 {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.rec-meta {
+  margin: 0.3rem 0 0;
+  color: var(--text-muted);
+  font-size: 0.83rem;
+}
+
+.rec-details {
+  margin-top: 0.62rem;
+}
+
+.rec-details p {
+  margin: 0.3rem 0;
+  color: #bed0e5;
+  font-size: 0.84rem;
+}
+
+.rec-command {
+  display: block;
+  background: rgba(10, 26, 42, 0.84);
+  border: 1px solid rgba(127, 159, 194, 0.28);
+  border-radius: 6px;
+  padding: 0.5rem;
+  font-family: "Consolas", "Courier New", monospace;
+  font-size: 0.8rem;
+  color: #b8d8fb;
+  margin-top: 0.3rem;
+  word-break: break-all;
+}
+
 .results-card {
   padding: 1rem;
 }
@@ -442,6 +500,21 @@ body {
   font-size: 0.84rem;
 }
 
+.expand-button {
+  border: 1px solid rgba(127, 159, 194, 0.42);
+  background: transparent;
+  color: #9fd6ff;
+  border-radius: 6px;
+  padding: 0.25rem 0.5rem;
+  cursor: pointer;
+  font-size: 0.8rem;
+  font-weight: 600;
+}
+
+.expand-button:hover {
+  background: rgba(127, 159, 194, 0.1);
+}
+
 .vuln-meta a {
   color: #9fd6ff;
   text-decoration: none;
@@ -465,7 +538,7 @@ body {
 
 @media (max-width: 960px) {
   .metric-grid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-columns: repeat(3, minmax(0, 1fr));
   }
 
   .chart-grid {

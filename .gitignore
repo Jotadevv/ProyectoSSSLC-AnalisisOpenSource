@@ -4,3 +4,10 @@ __pycache__/
 *.tsbuildinfo
 .env
 .runtime/
+*.json
+*.txt
+!requirements.txt
+!package.json
+!package-lock.json
+!tsconfig.json
+!vite.config.ts

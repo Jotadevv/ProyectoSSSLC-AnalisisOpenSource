@@ -22,6 +22,18 @@ type AuditSummary = {
   dependencies_scanned: number;
   fix_available: number;
   by_severity: Record<Severity, number>;
+  global_risk_level: string;
+  global_risk_score: number;
+};
+
+type Recommendation = {
+  package: string;
+  severity: string;
+  priority: number;
+  suggested_version: string | null;
+  update_command: string;
+  remediation_order: number;
+  vulnerability_count: number;
 };
 
 type AuditResponse = {
@@ -30,6 +42,7 @@ type AuditResponse = {
   duration_ms: number;
   summary: AuditSummary;
   vulnerabilities: Vulnerability[];
+  recommendations: Recommendation[];
   cached?: boolean;
 };
 
@@ -101,11 +114,32 @@ function buildFallbackSummary(vulnerabilities: Vulnerability[]): AuditSummary {
     }
   });
 
+  const total = vulnerabilities.length;
+  let global_risk_level = "Sin riesgo";
+  let global_risk_score = 0;
+  if (total > 0) {
+    const score = (
+      bySeverity.critical * 5 +
+      bySeverity.high * 4 +
+      bySeverity.moderate * 3 +
+      bySeverity.low * 2 +
+      bySeverity.info * 1 +
+      bySeverity.unknown * 0
+    ) / total;
+    global_risk_score = Math.round(score * 100) / 100;
+    if (score < 1.5) global_risk_level = "Bajo";
+    else if (score < 2.5) global_risk_level = "Medio";
+    else if (score < 3.5) global_risk_level = "Alto";
+    else global_risk_level = "Crítico";
+  }
+
   return {
-    total_vulnerabilities: vulnerabilities.length,
+    total_vulnerabilities: total,
     dependencies_scanned: 0,
     fix_available: fixAvailable,
     by_severity: bySeverity,
+    global_risk_level,
+    global_risk_score,
   };
 }
 
@@ -121,6 +155,7 @@ function parseApiResponse(payload: unknown): AuditResponse | null {
       duration_ms: 0,
       summary: buildFallbackSummary(payload as Vulnerability[]),
       vulnerabilities: payload as Vulnerability[],
+      recommendations: [],
       cached: false,
     };
   }
@@ -155,8 +190,13 @@ function parseApiResponse(payload: unknown): AuditResponse | null {
       fix_available:
         typeof rawSummary.fix_available === "number" ? rawSummary.fix_available : 0,
       by_severity: severityMap,
+      global_risk_level:
+        typeof rawSummary.global_risk_level === "string" ? rawSummary.global_risk_level : "Sin riesgo",
+      global_risk_score:
+        typeof rawSummary.global_risk_score === "number" ? rawSummary.global_risk_score : 0,
     },
     vulnerabilities,
+    recommendations: Array.isArray(payload.recommendations) ? payload.recommendations as Recommendation[] : [],
     cached: typeof payload.cached === "boolean" ? payload.cached : false,
   };
 }
@@ -205,6 +245,7 @@ function Home() {
   const [severityFilter, setSeverityFilter] = useState<SeverityFilter>("all");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [expandedDescriptions, setExpandedDescriptions] = useState<Set<string>>(new Set());
 
   const bySeverity = useMemo(() => {
     if (!audit) return emptySeverityMap();
@@ -270,6 +311,7 @@ function Home() {
     setShowRaw(false);
     setSearchTerm("");
     setSeverityFilter("all");
+    setExpandedDescriptions(new Set());
 
     const formData = new FormData();
     formData.append("file", selectedFile);
@@ -384,6 +426,15 @@ function Home() {
               </article>
 
               <article className="card metric-card">
+                <p>Nivel de riesgo global</p>
+                <h2 style={{ color: audit.summary.global_risk_level === 'Crítico' ? '#d73f3f' : 
+                             audit.summary.global_risk_level === 'Alto' ? '#ef7f2d' : 
+                             audit.summary.global_risk_level === 'Medio' ? '#f4b942' : '#35b6a9' }}>
+                  {audit.summary.global_risk_level}
+                </h2>
+              </article>
+
+              <article className="card metric-card">
                 <p>Tiempo de analisis</p>
                 <h2>{(audit.duration_ms / 1000).toFixed(2)}s</h2>
               </article>
@@ -440,6 +491,41 @@ function Home() {
               </article>
             </section>
 
+            {audit.recommendations && audit.recommendations.length > 0 && (
+              <section className="card recommendations-card">
+                <h3>Motor de recomendaciones</h3>
+                <div className="recommendations-list">
+                  {audit.recommendations.map((rec) => (
+                    <article className="rec-card" key={rec.package}>
+                      <div className="rec-top">
+                        <div>
+                          <h4>{rec.package}</h4>
+                          <p className="rec-meta">
+                            Prioridad: {rec.priority} | Orden: {rec.remediation_order} | 
+                            Vulnerabilidades: {rec.vulnerability_count}
+                          </p>
+                        </div>
+                        <span
+                          className="severity-badge"
+                          style={{ backgroundColor: `${severityColors[rec.severity as Severity]}22`, 
+                                   color: severityColors[rec.severity as Severity] }}
+                        >
+                          {severityLabels[rec.severity as Severity]}
+                        </span>
+                      </div>
+                      <div className="rec-details">
+                        {rec.suggested_version && (
+                          <p><strong>Versión sugerida:</strong> {rec.suggested_version}</p>
+                        )}
+                        <p><strong>Comando de actualización:</strong></p>
+                        <code className="rec-command">{rec.update_command}</code>
+                      </div>
+                    </article>
+                  ))}
+                </div>
+              </section>
+            )}
+
             <section className="card results-card">
               <div className="results-toolbar">
                 <input
@@ -482,8 +568,10 @@ function Home() {
                   ) : (
                     filteredVulnerabilities.map((vulnerability, index) => {
                       const severity = normalizeSeverity(vulnerability.severity);
+                      const vulnKey = `${vulnerability.id || vulnerability.name}-${index}`;
+                      const isExpanded = expandedDescriptions.has(vulnKey);
                       return (
-                        <article className="vuln-card" key={`${vulnerability.id || vulnerability.name}-${index}`}>
+                        <article className="vuln-card" key={vulnKey}>
                           <div className="vuln-top">
                             <div>
                               <h4>{vulnerability.name || vulnerability.package || "Vulnerabilidad"}</h4>
@@ -508,9 +596,27 @@ function Home() {
                                 Referencia
                               </a>
                             )}
+                            {vulnerability.description && (
+                              <button 
+                                className="expand-button"
+                                onClick={() => {
+                                  const newExpanded = new Set(expandedDescriptions);
+                                  if (isExpanded) {
+                                    newExpanded.delete(vulnKey);
+                                  } else {
+                                    newExpanded.add(vulnKey);
+                                  }
+                                  setExpandedDescriptions(newExpanded);
+                                }}
+                              >
+                                {isExpanded ? "Ver menos" : "Ver más"}
+                              </button>
+                            )}
                           </div>
 
-                          {vulnerability.description && <p className="vuln-description">{vulnerability.description}</p>}
+                          {isExpanded && vulnerability.description && (
+                            <p className="vuln-description">{vulnerability.description}</p>
+                          )}
                         </article>
                       );
                     })

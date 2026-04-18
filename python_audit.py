@@ -20,6 +20,152 @@ def requirements_are_exact_pins(requirements_text: str) -> bool:
 
     return has_packages
 
+def run_python_audit():
+    print("1. Verificando pip-audit")
+    try:
+        subprocess.run([sys.executable, "-m", "pip_audit", "--version"], check=True, capture_output=True)
+    except subprocess.CalledProcessError:
+        print("pip-audit no está instalado. Instalando...")
+        try:
+            subprocess.run([sys.executable, "-m", "pip", "install", "pip-audit"], check=True)
+        except subprocess.CalledProcessError:
+            print("Error instalando pip-audit")
+            return False
+
+    print("2. Verificando requirements.txt")
+    if not os.path.exists("requirements.txt"):
+        print("Error: No se encontró requirements.txt en el directorio actual")
+        return False
+
+    print("3. Leyendo requirements.txt")
+    try:
+        with open("requirements.txt", "r", encoding="utf-8") as req_file:
+            requirements_text = req_file.read()
+    except Exception as e:
+        print(f"Error leyendo requirements.txt: {e}")
+        return False
+
+    print("4. Ejecutando pip-audit")
+    try:
+        # Crear archivo temporal para requirements
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as temp_file:
+            temp_file.write(requirements_text)
+            temp_path = temp_file.name
+
+        try:
+            result = subprocess.run([
+                sys.executable, "-m", "pip_audit",
+                "--format", "json",
+                "--requirement", temp_path
+            ], capture_output=True, text=True, check=True)
+
+            audit_data = json.loads(result.stdout)
+            with open("python_output.json", "w", encoding="utf-8") as f:
+                json.dump(audit_data, f, indent=2, ensure_ascii=False)
+            print("Resultado guardado en python_output.json")
+        finally:
+            os.unlink(temp_path)
+
+    except subprocess.CalledProcessError as e:
+        print(f"Error ejecutando pip-audit: {e}")
+        if e.stderr:
+            print(f"Stderr: {e.stderr}")
+        return False
+    except json.JSONDecodeError as e:
+        print(f"Error parseando JSON: {e}")
+        return False
+
+    print("5. Procesando vulnerabilidades")
+    vulnerabilities = []
+    if "dependencies" in audit_data:
+        for dependency in audit_data["dependencies"]:
+            pkg_name = dependency.get("name", "unknown")
+            pkg_version = dependency.get("version", "unknown")
+
+            for vuln in dependency.get("vulns", []):
+                vuln_entry = {
+                    "id": vuln.get("id", pkg_name),
+                    "package": pkg_name,
+                    "version": pkg_version,
+                    "severity": vuln.get("severity", "unknown"),
+                    "description": vuln.get("description", "").strip(),
+                    "fix_available": len(vuln.get("fix_versions", [])) > 0
+                }
+                if vuln.get("fix_versions"):
+                    vuln_entry["fixed_in"] = ", ".join(vuln["fix_versions"])
+                vulnerabilities.append(vuln_entry)
+
+    with open("audit_results.json", "w", encoding="utf-8") as json_file:
+        json.dump(vulnerabilities, json_file, indent=2, ensure_ascii=False)
+
+    print(f"Procesadas {len(vulnerabilities)} vulnerabilidades")
+    print("Resultado guardado en audit_results.json")
+    return True
+
+def consolidate_reports():
+    print("6. Consolidando reportes")
+
+    # Leer resultados de Python
+    python_vulns = []
+    if os.path.exists("audit_results.json"):
+        try:
+            with open("audit_results.json", "r") as f:
+                python_vulns = json.load(f)
+        except json.JSONDecodeError:
+            print("Error leyendo audit_results.json")
+
+    # Leer resultados de npm (si existen)
+    npm_vulns = []
+    if os.path.exists("npm_audit_results.json"):
+        try:
+            with open("npm_audit_results.json", "r") as f:
+                npm_vulns = json.load(f)
+        except json.JSONDecodeError:
+            print("Error leyendo npm_audit_results.json")
+
+    consolidated = {
+        "python_vulnerabilities": python_vulns,
+        "npm_vulnerabilities": npm_vulns,
+        "total_python": len(python_vulns),
+        "total_npm": len(npm_vulns),
+        "total_vulnerabilities": len(python_vulns) + len(npm_vulns)
+    }
+
+    with open("consolidated_report.json", "w") as f:
+        json.dump(consolidated, f, indent=2, ensure_ascii=False)
+
+    print(f"Reporte consolidado guardado en consolidated_report.json")
+    print(f"Total vulnerabilidades: {consolidated['total_vulnerabilities']}")
+
+if __name__ == "__main__":
+    if run_python_audit():
+        consolidate_reports()
+        print("Auditoría Python completada exitosamente")
+    else:
+        print("Error en la auditoría Python")
+        sys.exit(1)import subprocess
+import json
+import os
+import sys
+
+def requirements_are_exact_pins(requirements_text: str) -> bool:
+    has_packages = False
+
+    for raw_line in requirements_text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith(("-", "--")):
+            return False
+
+        requirement = line.split(" #", 1)[0].strip()
+        if "==" not in requirement:
+            return False
+        has_packages = True
+
+    return has_packages
+
 
 def has_valid_pip_audit_json(stdout: str) -> bool:
     text = (stdout or "").strip()

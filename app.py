@@ -197,12 +197,100 @@ def _build_summary(vulnerabilities: list[dict[str, Any]], dependencies_scanned: 
         if vuln.get("fix_available"):
             fix_available += 1
 
+    # Calculate global risk score
+    total = len(vulnerabilities)
+    if total == 0:
+        global_risk_level = "Sin riesgo"
+        global_risk_score = 0
+    else:
+        score = (
+            by_severity["critical"] * 5 +
+            by_severity["high"] * 4 +
+            by_severity["moderate"] * 3 +
+            by_severity["low"] * 2 +
+            by_severity["info"] * 1 +
+            by_severity["unknown"] * 0
+        ) / total
+        global_risk_score = round(score, 2)
+        if score < 1.5:
+            global_risk_level = "Bajo"
+        elif score < 2.5:
+            global_risk_level = "Medio"
+        elif score < 3.5:
+            global_risk_level = "Alto"
+        else:
+            global_risk_level = "Crítico"
+
     return {
-        "total_vulnerabilities": len(vulnerabilities),
+        "total_vulnerabilities": total,
         "dependencies_scanned": dependencies_scanned,
         "fix_available": fix_available,
         "by_severity": by_severity,
+        "global_risk_level": global_risk_level,
+        "global_risk_score": global_risk_score,
     }
+
+
+def _generate_recommendations(vulnerabilities: list[dict[str, Any]], ecosystem: str) -> list[dict[str, Any]]:
+    recommendations = []
+    severity_priority = {"critical": 4, "high": 3, "moderate": 2, "low": 1, "info": 0, "unknown": 0}
+    
+    # Group by package
+    package_groups = {}
+    for vuln in vulnerabilities:
+        pkg = vuln.get("package", "unknown")
+        if pkg not in package_groups:
+            package_groups[pkg] = []
+        package_groups[pkg].append(vuln)
+    
+    # Sort packages by highest severity
+    sorted_packages = sorted(package_groups.keys(), 
+                           key=lambda p: max(severity_priority.get(_normalize_severity(v.get("severity")), 0) 
+                                           for v in package_groups[p]), 
+                           reverse=True)
+    
+    order = 1
+    for pkg in sorted_packages:
+        vulns = package_groups[pkg]
+        highest_severity = max(vulns, key=lambda v: severity_priority.get(_normalize_severity(v.get("severity")), 0))
+        severity = _normalize_severity(highest_severity.get("severity"))
+        priority = severity_priority.get(severity, 0)
+        
+        # Find suggested version
+        suggested_version = None
+        if highest_severity.get("fixed_in"):
+            fixed_in = str(highest_severity["fixed_in"])
+            if fixed_in and fixed_in.lower() != "no disponible":
+                # Extract version from "version" or "version1, version2"
+                versions = [v.strip() for v in fixed_in.split(",")]
+                suggested_version = versions[0] if versions else None
+        
+        # Generate update command
+        if ecosystem == "python":
+            if suggested_version:
+                command = f"pip install --upgrade {pkg}=={suggested_version}"
+            else:
+                command = f"pip install --upgrade {pkg}"
+        elif ecosystem == "npm":
+            if suggested_version:
+                command = f"npm update {pkg}@{suggested_version}"
+            else:
+                command = f"npm update {pkg}"
+        else:
+            command = f"Actualizar {pkg} a la versión más reciente"
+        
+        recommendations.append({
+            "package": pkg,
+            "severity": severity,
+            "priority": priority,
+            "suggested_version": suggested_version,
+            "update_command": command,
+            "remediation_order": order,
+            "vulnerability_count": len(vulns)
+        })
+        order += 1
+    
+    return recommendations
 
 
 def _parse_python_audit(raw_output: dict[str, Any]) -> tuple[list[dict[str, Any]], int]:
@@ -227,13 +315,29 @@ def _parse_python_audit(raw_output: dict[str, Any]) -> tuple[list[dict[str, Any]
             if isinstance(vuln_id, str) and vuln_id.startswith("CVE-"):
                 url = f"https://nvd.nist.gov/vuln/detail/{vuln_id}"
 
+            # Calculate severity if not provided
+            vuln_severity = vulnerability.get("severity")
+            if not vuln_severity or vuln_severity == "unknown":
+                # Simple heuristic: recent CVEs tend to be more severe
+                if isinstance(vuln_id, str) and vuln_id.startswith("CVE-"):
+                    try:
+                        year = int(vuln_id.split("-")[1])
+                        if year >= 2024:
+                            vuln_severity = "high"  # Recent CVEs are often high severity
+                        else:
+                            vuln_severity = "moderate"
+                    except:
+                        vuln_severity = "moderate"
+                else:
+                    vuln_severity = "moderate"
+
             vulnerabilities.append(
                 {
                     "id": vuln_id,
                     "name": vuln_id,
                     "package": package_name,
                     "version": package_version,
-                    "severity": _normalize_severity(vulnerability.get("severity")),
+                    "severity": _normalize_severity(vuln_severity),
                     "fixed_in": fixed_in,
                     "fix_available": fix_available,
                     "description": (vulnerability.get("description") or "").strip(),
@@ -432,6 +536,7 @@ def _run_python_audit(requirements_text: str) -> tuple[dict[str, Any], dict[str,
 
     vulnerabilities, dependencies_scanned = _parse_python_audit(raw)
     summary = _build_summary(vulnerabilities, dependencies_scanned)
+    recommendations = _generate_recommendations(vulnerabilities, "python")
 
     payload = {
         "ecosystem": "python",
@@ -439,6 +544,7 @@ def _run_python_audit(requirements_text: str) -> tuple[dict[str, Any], dict[str,
         "duration_ms": duration_ms,
         "summary": summary,
         "vulnerabilities": vulnerabilities,
+        "recommendations": recommendations,
         "audit_mode": (
             "pinned-no-deps"
             if used_no_deps_mode and exact_pins
@@ -484,6 +590,7 @@ def _run_npm_audit(package_json_text: str) -> tuple[dict[str, Any], dict[str, An
 
     vulnerabilities, dependencies_scanned = _parse_npm_audit(raw)
     summary = _build_summary(vulnerabilities, dependencies_scanned)
+    recommendations = _generate_recommendations(vulnerabilities, "npm")
 
     payload = {
         "ecosystem": "npm",
@@ -491,6 +598,7 @@ def _run_npm_audit(package_json_text: str) -> tuple[dict[str, Any], dict[str, An
         "duration_ms": duration_ms,
         "summary": summary,
         "vulnerabilities": vulnerabilities,
+        "recommendations": recommendations,
     }
 
     return payload, raw
