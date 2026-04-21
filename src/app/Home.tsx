@@ -298,7 +298,7 @@ function Home() {
     const selectedFile = event.target.files?.[0] || null;
     if (!selectedFile) return;
 
-    if (selectedFile.name !== "requirements.txt" && selectedFile.name !== "package.json") {
+    if (!selectedFile.name.endsWith(".txt") && selectedFile.name !== "package.json") {
       setError("Solo se permiten requirements.txt o package.json");
       return;
     }
@@ -317,7 +317,7 @@ function Home() {
     formData.append("file", selectedFile);
 
     try {
-      const endpoint = selectedFile.name === "requirements.txt" ? "/audit/python" : "/audit/npm";
+      const endpoint = selectedFile.name.endsWith(".txt") ? "/audit/python" : "/audit/npm";
       const response = await fetch(endpoint, { method: "POST", body: formData });
       const payload = (await response.json()) as unknown;
 
@@ -337,7 +337,7 @@ function Home() {
 
       setAudit(parsed);
 
-      if (selectedFile.name === "requirements.txt") {
+      if (selectedFile.name.endsWith(".txt")) {
         try {
           const rawResponse = await fetch("/audit/python_output");
           if (rawResponse.ok) {
