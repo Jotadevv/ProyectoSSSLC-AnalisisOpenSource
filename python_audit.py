@@ -1,324 +1,219 @@
+"""
+audit_python.py
+Versión final:
+- Resolución determinística con pip-tools (pip-compile)
+- OSV batch queries
+- Cache persistente
+- Connection pooling
+- Paralelización por chunks
+"""
+
+import json
+import os
 import subprocess
-import json
-import os
 import sys
+import requests
+from threading import Lock
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-def requirements_are_exact_pins(requirements_text: str) -> bool:
-    has_packages = False
+# ── Config ─────────────────────────────────────────
 
-    for raw_line in requirements_text.splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if line.startswith(("-", "--")):
-            return False
+MAX_WORKERS = int(os.environ.get("AUDIT_WORKERS", 8))
+CHUNK_SIZE = int(os.environ.get("AUDIT_CHUNK", 50))
 
-        requirement = line.split(" #", 1)[0].strip()
-        if "==" not in requirement:
-            return False
-        has_packages = True
+REQUIREMENTS_PATH = "requirements.txt"
+LOCK_PATH = "requirements.lock"
+CACHE_PATH = "osv_cache.json"
 
-    return has_packages
+OSV_URL = "https://api.osv.dev/v1/querybatch"
 
-def run_python_audit():
-    print("1. Verificando pip-audit")
-    try:
-        subprocess.run([sys.executable, "-m", "pip_audit", "--version"], check=True, capture_output=True)
-    except subprocess.CalledProcessError:
-        print("pip-audit no está instalado. Instalando...")
-        try:
-            subprocess.run([sys.executable, "-m", "pip", "install", "pip-audit"], check=True)
-        except subprocess.CalledProcessError:
-            print("Error instalando pip-audit")
-            return False
+# ── HTTP + Cache ───────────────────────────────────
 
-    print("2. Verificando requirements.txt")
-    if not os.path.exists("requirements.txt"):
-        print("Error: No se encontró requirements.txt en el directorio actual")
-        return False
+_session = requests.Session()
+_cache_lock = Lock()
 
-    print("3. Leyendo requirements.txt")
-    try:
-        with open("requirements.txt", "r", encoding="utf-8") as req_file:
-            requirements_text = req_file.read()
-    except Exception as e:
-        print(f"Error leyendo requirements.txt: {e}")
-        return False
-
-    print("4. Ejecutando pip-audit")
-    try:
-        # Crear archivo temporal para requirements
-        import tempfile
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as temp_file:
-            temp_file.write(requirements_text)
-            temp_path = temp_file.name
-
-        try:
-            result = subprocess.run([
-                sys.executable, "-m", "pip_audit",
-                "--format", "json",
-                "--requirement", temp_path
-            ], capture_output=True, text=True, check=True)
-
-            audit_data = json.loads(result.stdout)
-            with open("python_output.json", "w", encoding="utf-8") as f:
-                json.dump(audit_data, f, indent=2, ensure_ascii=False)
-            print("Resultado guardado en python_output.json")
-        finally:
-            os.unlink(temp_path)
-
-    except subprocess.CalledProcessError as e:
-        print(f"Error ejecutando pip-audit: {e}")
-        if e.stderr:
-            print(f"Stderr: {e.stderr}")
-        return False
-    except json.JSONDecodeError as e:
-        print(f"Error parseando JSON: {e}")
-        return False
-
-    print("5. Procesando vulnerabilidades")
-    vulnerabilities = []
-    if "dependencies" in audit_data:
-        for dependency in audit_data["dependencies"]:
-            pkg_name = dependency.get("name", "unknown")
-            pkg_version = dependency.get("version", "unknown")
-
-            for vuln in dependency.get("vulns", []):
-                vuln_entry = {
-                    "id": vuln.get("id", pkg_name),
-                    "package": pkg_name,
-                    "version": pkg_version,
-                    "severity": vuln.get("severity", "unknown"),
-                    "description": vuln.get("description", "").strip(),
-                    "fix_available": len(vuln.get("fix_versions", [])) > 0
-                }
-                if vuln.get("fix_versions"):
-                    vuln_entry["fixed_in"] = ", ".join(vuln["fix_versions"])
-                vulnerabilities.append(vuln_entry)
-
-    with open("audit_results.json", "w", encoding="utf-8") as json_file:
-        json.dump(vulnerabilities, json_file, indent=2, ensure_ascii=False)
-
-    print(f"Procesadas {len(vulnerabilities)} vulnerabilidades")
-    print("Resultado guardado en audit_results.json")
-    return True
-
-def consolidate_reports():
-    print("6. Consolidando reportes")
-
-    # Leer resultados de Python
-    python_vulns = []
-    if os.path.exists("audit_results.json"):
-        try:
-            with open("audit_results.json", "r") as f:
-                python_vulns = json.load(f)
-        except json.JSONDecodeError:
-            print("Error leyendo audit_results.json")
-
-    # Leer resultados de npm (si existen)
-    npm_vulns = []
-    if os.path.exists("npm_audit_results.json"):
-        try:
-            with open("npm_audit_results.json", "r") as f:
-                npm_vulns = json.load(f)
-        except json.JSONDecodeError:
-            print("Error leyendo npm_audit_results.json")
-
-    consolidated = {
-        "python_vulnerabilities": python_vulns,
-        "npm_vulnerabilities": npm_vulns,
-        "total_python": len(python_vulns),
-        "total_npm": len(npm_vulns),
-        "total_vulnerabilities": len(python_vulns) + len(npm_vulns)
-    }
-
-    with open("consolidated_report.json", "w") as f:
-        json.dump(consolidated, f, indent=2, ensure_ascii=False)
-
-    print(f"Reporte consolidado guardado en consolidated_report.json")
-    print(f"Total vulnerabilidades: {consolidated['total_vulnerabilities']}")
-
-if __name__ == "__main__":
-    if run_python_audit():
-        consolidate_reports()
-        print("Auditoría Python completada exitosamente")
-    else:
-        print("Error en la auditoría Python")
-        sys.exit(1)import subprocess
-import json
-import os
-import sys
-
-def requirements_are_exact_pins(requirements_text: str) -> bool:
-    has_packages = False
-
-    for raw_line in requirements_text.splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if line.startswith(("-", "--")):
-            return False
-
-        requirement = line.split(" #", 1)[0].strip()
-        if "==" not in requirement:
-            return False
-        has_packages = True
-
-    return has_packages
+if os.path.exists(CACHE_PATH):
+    with open(CACHE_PATH, "r", encoding="utf-8") as f:
+        OSV_CACHE = json.load(f)
+else:
+    OSV_CACHE = {}
 
 
-def has_valid_pip_audit_json(stdout: str) -> bool:
-    text = (stdout or "").strip()
-    if not text:
-        return False
-
-    try:
-        payload = json.loads(text)
-    except json.JSONDecodeError:
-        return False
-
-    return isinstance(payload, dict) and isinstance(payload.get("dependencies"), list)
+def save_cache():
+    with _cache_lock:
+        with open(CACHE_PATH, "w", encoding="utf-8") as f:
+            json.dump(OSV_CACHE, f)
 
 
-def run_audit():
-    print("--- 1. Verificando pip-audit ---")
-    try:
-        subprocess.run([sys.executable, "-m", "pip_audit", "--version"], 
-                      check=True, capture_output=True)
-        print("pip-audit ya está instalado")
-    except subprocess.CalledProcessError:
-        print("pip-audit no está instalado, instalando...")
-        subprocess.run([sys.executable, "-m", "pip", "install", "pip-audit"], check=True)
+def _cache_key(name, version):
+    return f"{name}=={version}"
 
-    print("--- 2. Ejecutando auditoría y generando archivo JSON ---")
-    requirements_path = "requirements.txt"
-    if not os.path.exists(requirements_path):
-        print("Error: No se encontró requirements.txt")
-        return False
 
-    with open(requirements_path, "r", encoding="utf-8") as req_file:
-        requirements_text = req_file.read()
+def osv_batch_query(packages):
+    queries = []
+    results = {}
 
-    base_cmd = [sys.executable, "-m", "pip_audit", "--format", "json", "--requirement", requirements_path]
-    result = subprocess.run(base_cmd, capture_output=True, text=True)
-    run_is_usable = result.returncode in (0, 1) and has_valid_pip_audit_json(result.stdout)
-
-    if not run_is_usable and requirements_are_exact_pins(requirements_text):
-        print("Fallo resolviendo dependencias; reintentando en modo pinned (--no-deps --disable-pip)")
-        fallback_cmd = [*base_cmd, "--no-deps", "--disable-pip"]
-        fallback_result = subprocess.run(fallback_cmd, capture_output=True, text=True)
-        fallback_is_usable = fallback_result.returncode in (0, 1) and has_valid_pip_audit_json(
-            fallback_result.stdout
-        )
-        if fallback_is_usable:
-            result = fallback_result
+    for name, version in packages:
+        key = _cache_key(name, version)
+        if key in OSV_CACHE:
+            results[key] = OSV_CACHE[key]
         else:
-            print("Error en fallback:", fallback_result.stderr)
+            queries.append({
+                "package": {"name": name, "ecosystem": "PyPI"},
+                "version": version
+            })
 
-    with open("python_output.json", "w", encoding="utf-8") as f:
-        f.write(result.stdout)
+    if queries:
+        try:
+            resp = _session.post(OSV_URL, json={"queries": queries}, timeout=15)
+            data = resp.json()
 
-    if result.returncode not in (0, 1):
-        print("Error al ejecutar pip-audit:", result.stderr)
-        return False
-    if not has_valid_pip_audit_json(result.stdout):
-        print("Error: pip-audit no devolvió JSON válido.", result.stderr)
-        return False
+            for q, res in zip(queries, data.get("results", [])):
+                key = _cache_key(q["package"]["name"], q["version"])
+                with _cache_lock:
+                    OSV_CACHE[key] = res
+                results[key] = res
 
-    return True
+        except Exception as e:
+            print(f"[osv] error: {e}")
 
-def parse_to_json(file_path):
-    print("--- 3. Parseando resultados a JSON ---")
-    results = []
-    
-    if not os.path.exists(file_path):
-        print("Error: No se encontró el archivo de salida.")
+    return results
+
+
+# ── pip-tools (pip-compile) ─────────────────────────
+
+def ensure_pip_tools():
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "piptools", "--version"],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "pip-tools"],
+            check=True
+        )
+
+
+def generate_lockfile():
+    if os.path.exists(LOCK_PATH):
         return
 
-    with open(file_path, "r", encoding="utf-8") as f:
-        try:
-            audit_data = json.load(f)
-        except json.JSONDecodeError as e:
-            print("Error al parsear JSON de pip-audit:", e)
-            return
+    print("[lock] Generando requirements.lock con pip-compile...")
 
-    if isinstance(audit_data, dict):
-        if "dependencies" in audit_data:
-            for dependency in audit_data.get("dependencies", []):
-                pkg_name = dependency.get("name", "unknown")
-                pkg_version = dependency.get("version", "unknown")
-                for vuln in dependency.get("vulns", []):
-                    entry = {
-                        "name": vuln.get("id") or pkg_name,
-                        "package": pkg_name,
-                        "version": pkg_version,
-                        "severity": vuln.get("severity", "unknown"),
-                        "fixed_in": ", ".join(vuln.get("fix_versions", [])) if isinstance(vuln.get("fix_versions"), list) else vuln.get("fix_versions", "No disponible"),
-                        "description": vuln.get("description", ""),
-                    }
-                    results.append(entry)
-        elif "vulnerabilities" in audit_data:
-            audit_data = audit_data["vulnerabilities"]
-            for item in audit_data or []:
-                entry = {
-                    "name": item.get("id") or item.get("package") or "unknown",
-                    "package": item.get("package", "unknown"),
-                    "version": item.get("version", "unknown"),
-                    "severity": item.get("severity", "unknown"),
-                    "fixed_in": ", ".join(item.get("fix_versions", [])) if isinstance(item.get("fix_versions"), list) else item.get("fix_versions", "No disponible"),
-                    "description": item.get("description", ""),
-                }
-                results.append(entry)
-        else:
-            for item in audit_data or []:
-                if isinstance(item, str):
-                    entry = {
-                        "name": item,
-                        "package": item,
-                        "version": "unknown",
-                        "severity": "unknown",
-                        "fixed_in": "No disponible",
-                        "description": "",
-                    }
-                else:
-                    entry = {
-                        "name": item.get("id") or item.get("package") or "unknown",
-                        "package": item.get("package", "unknown"),
-                        "version": item.get("version", "unknown"),
-                        "severity": item.get("severity", "unknown"),
-                        "fixed_in": ", ".join(item.get("fix_versions", [])) if isinstance(item.get("fix_versions"), list) else item.get("fix_versions", "No disponible"),
-                        "description": item.get("description", ""),
-                    }
-                results.append(entry)
-    else:
-        for item in audit_data or []:
-            if isinstance(item, str):
-                entry = {
-                    "name": item,
-                    "package": item,
-                    "version": "unknown",
-                    "severity": "unknown",
-                    "fixed_in": "No disponible",
-                    "description": "",
-                }
-            else:
-                entry = {
-                    "name": item.get("id") or item.get("package") or "unknown",
-                    "package": item.get("package", "unknown"),
-                    "version": item.get("version", "unknown"),
-                    "severity": item.get("severity", "unknown"),
-                    "fixed_in": ", ".join(item.get("fix_versions", [])) if isinstance(item.get("fix_versions"), list) else item.get("fix_versions", "No disponible"),
-                    "description": item.get("description", ""),
-                }
-            results.append(entry)
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "piptools",
+            "compile",
+            REQUIREMENTS_PATH,
+            "--output-file",
+            LOCK_PATH,
+            "--quiet"
+        ],
+        check=True
+    )
 
-    with open("audit_results.json", "w", encoding="utf-8") as json_file:
-        json.dump(results, json_file, indent=4)
-    
-    print(f"Se han procesado {len(results)} vulnerabilidades en 'audit_results.json'.")
+
+# ── Helpers ────────────────────────────────────────
+
+def load_lockfile():
+    with open(LOCK_PATH, "r", encoding="utf-8") as f:
+        lines = [
+            l.strip()
+            for l in f
+            if l.strip() and not l.startswith("#") and "==" in l
+        ]
+    return lines
+
+
+def extract_packages(lines):
+    result = []
+    for line in lines:
+        name, version = line.split("==", 1)
+        result.append((name.strip(), version.strip()))
+    return result
+
+
+def chunks(lst, size):
+    for i in range(0, len(lst), size):
+        yield lst[i:i + size]
+
+
+# ── Audit ──────────────────────────────────────────
+
+def audit_chunk(packages, chunk_id):
+    osv_results = osv_batch_query(packages)
+
+    vulns = []
+
+    for name, version in packages:
+        key = _cache_key(name, version)
+        data = osv_results.get(key, {})
+
+        for vuln in data.get("vulns", []):
+            vulns.append({
+                "name": vuln.get("id"),
+                "package": name,
+                "version": version,
+                "severity": vuln.get("severity", "unknown"),
+                "fixed_in": ", ".join(vuln.get("fix_versions", [])),
+                "description": vuln.get("summary", ""),
+            })
+
+    print(f"[chunk {chunk_id}] ⚡ {len(vulns)} vulns")
+    return vulns
+
+
+def audit_all(packages):
+    all_vulns = []
+    seen = set()
+
+    pkg_chunks = list(chunks(packages, CHUNK_SIZE))
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        futures = [
+            pool.submit(audit_chunk, chunk, i)
+            for i, chunk in enumerate(pkg_chunks)
+        ]
+
+        for f in as_completed(futures):
+            for v in f.result():
+                key = f"{v['package']}:{v['version']}:{v['name']}"
+                if key not in seen:
+                    seen.add(key)
+                    all_vulns.append(v)
+
+    return all_vulns
+
+
+# ── Main ───────────────────────────────────────────
+
+def run():
+    if not os.path.exists(REQUIREMENTS_PATH):
+        print("No requirements.txt")
+        return
+
+    ensure_pip_tools()
+    generate_lockfile()
+
+    lines = load_lockfile()
+    packages = extract_packages(lines)
+
+    print(f"[info] paquetes: {len(packages)}")
+
+    vulns = audit_all(packages)
+
+    save_cache()
+
+    with open("audit_results.json", "w", encoding="utf-8") as f:
+        json.dump(vulns, f, indent=2)
+
+    print(f"\n✅ {len(vulns)} vulnerabilidades encontradas")
+
 
 if __name__ == "__main__":
-    if run_audit():
-        parse_to_json("python_output.json")
-    else:
-        print("Error en la ejecución de la auditoría de Python")
+    run()

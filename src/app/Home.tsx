@@ -294,68 +294,76 @@ function Home() {
       .slice(0, 6);
   }, [audit]);
 
-  const handleFileChange = async (event: ChangeEvent<HTMLInputElement>) => {
-    const selectedFile = event.target.files?.[0] || null;
-    if (!selectedFile) return;
+const handleFileChange = async (event: ChangeEvent<HTMLInputElement>) => {
+  const selectedFile = event.target.files?.[0] || null;
+  if (!selectedFile) return;
 
-    if (!selectedFile.name.endsWith(".txt") && selectedFile.name !== "package.json") {
-      setError("Solo se permiten requirements.txt o package.json");
+  const fileName = selectedFile.name.toLowerCase();
+
+  const isPythonFile =
+    fileName === "requirements.txt" || fileName === "requirements-dev.txt";
+
+  const isNpmFile = fileName === "package.json";
+
+  if (!isPythonFile && !isNpmFile) {
+    setError("Solo se permiten requirements.txt, requirements-dev.txt o package.json");
+    return;
+  }
+
+  setFileName(selectedFile.name);
+  setLoading(true);
+  setError(null);
+  setAudit(null);
+  setRawResults(null);
+  setShowRaw(false);
+  setSearchTerm("");
+  setSeverityFilter("all");
+  setExpandedDescriptions(new Set());
+
+  const formData = new FormData();
+  formData.append("file", selectedFile);
+
+  try {
+    const endpoint = isPythonFile ? "/audit/python" : "/audit/npm";
+    const response = await fetch(endpoint, { method: "POST", body: formData });
+    const payload = (await response.json()) as unknown;
+
+    if (!response.ok) {
+      const message =
+        isRecord(payload) && typeof payload.error === "string"
+          ? payload.error
+          : "Error ejecutando auditoria";
+      setError(message);
       return;
     }
 
-    setFileName(selectedFile.name);
-    setLoading(true);
-    setError(null);
-    setAudit(null);
-    setRawResults(null);
-    setShowRaw(false);
-    setSearchTerm("");
-    setSeverityFilter("all");
-    setExpandedDescriptions(new Set());
-
-    const formData = new FormData();
-    formData.append("file", selectedFile);
-
-    try {
-      const endpoint = selectedFile.name.endsWith(".txt") ? "/audit/python" : "/audit/npm";
-      const response = await fetch(endpoint, { method: "POST", body: formData });
-      const payload = (await response.json()) as unknown;
-
-      if (!response.ok) {
-        const message = isRecord(payload) && typeof payload.error === "string"
-          ? payload.error
-          : "Error ejecutando auditoria";
-        setError(message);
-        return;
-      }
-
-      const parsed = parseApiResponse(payload);
-      if (!parsed) {
-        setError("La API devolvio un formato inesperado");
-        return;
-      }
-
-      setAudit(parsed);
-
-      if (selectedFile.name.endsWith(".txt")) {
-        try {
-          const rawResponse = await fetch("/audit/python_output");
-          if (rawResponse.ok) {
-            const rawPayload = (await rawResponse.json()) as unknown;
-            setRawResults(rawPayload);
-          }
-        } catch (rawError) {
-          console.error("No se pudo cargar el resultado crudo", rawError);
-        }
-      }
-    } catch (requestError) {
-      console.error(requestError);
-      setError("No se pudo conectar con el backend de auditoria");
-    } finally {
-      setLoading(false);
-      event.target.value = "";
+    const parsed = parseApiResponse(payload);
+    if (!parsed) {
+      setError("La API devolvio un formato inesperado");
+      return;
     }
-  };
+
+    setAudit(parsed);
+
+    if (isPythonFile) {
+      try {
+        const rawResponse = await fetch("/audit/python_output");
+        if (rawResponse.ok) {
+          const rawPayload = (await rawResponse.json()) as unknown;
+          setRawResults(rawPayload);
+        }
+      } catch (rawError) {
+        console.error("No se pudo cargar el resultado crudo", rawError);
+      }
+    }
+  } catch (requestError) {
+    console.error(requestError);
+    setError("No se pudo conectar con el backend de auditoria");
+  } finally {
+    setLoading(false);
+    event.target.value = "";
+  }
+};
 
   return (
     <div className="page-shell">
