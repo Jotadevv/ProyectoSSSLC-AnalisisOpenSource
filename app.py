@@ -3,14 +3,19 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import quote_plus
+from urllib.request import Request, urlopen
+from urllib.error import URLError, HTTPError
 
 from flask import Flask, jsonify, request, send_from_directory
 
@@ -19,7 +24,9 @@ app = Flask(__name__, static_folder="dist", static_url_path="")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 RUNTIME_DIR = os.path.join(BASE_DIR, ".runtime")
 CACHE_TTL_SECONDS = 300
+INTEL_CACHE_TTL_SECONDS = 3600
 COMMAND_TIMEOUT_SECONDS = 240
+HTTP_TIMEOUT_SECONDS = 6
 SEVERITY_KEYS = ["critical", "high", "moderate", "low", "info", "unknown"]
 SEVERITY_WEIGHT = {
     "critical": 5,
@@ -37,6 +44,58 @@ audit_cache: dict[str, dict[str, Any]] = {}
 pip_audit_ready = False
 npm_cmd_path: str | None = None
 latest_python_raw: dict[str, Any] | None = None
+intel_cache: dict[str, dict[str, Any]] = {}
+kev_cache: dict[str, Any] = {"created_at": 0, "set": {}}
+
+CVE_PATTERN = re.compile(r"^CVE-\d{4}-\d{4,}$", re.IGNORECASE)
+GHSA_PATTERN = re.compile(r"^GHSA-[A-Za-z0-9]{4}-[A-Za-z0-9]{4}-[A-Za-z0-9]{4}$", re.IGNORECASE)
+PYSEC_PATTERN = re.compile(r"^PYSEC-\d{4}-\d+$", re.IGNORECASE)
+CVE_SEARCH_PATTERN = re.compile(r"CVE-\d{4}-\d{4,}", re.IGNORECASE)
+GHSA_SEARCH_PATTERN = re.compile(r"GHSA-[A-Za-z0-9]{4}-[A-Za-z0-9]{4}-[A-Za-z0-9]{4}", re.IGNORECASE)
+PYSEC_SEARCH_PATTERN = re.compile(r"PYSEC-\d{4}-\d+", re.IGNORECASE)
+
+VULNERABILITY_DATABASES = [
+    {
+        "id": "nvd",
+        "name": "NVD (NIST)",
+        "description": "Detalle tecnico oficial de CVE, CVSS y referencias.",
+    },
+    {
+        "id": "mitre_cve",
+        "name": "MITRE CVE",
+        "description": "Registro canonico del identificador CVE.",
+    },
+    {
+        "id": "osv",
+        "name": "OSV.dev",
+        "description": "Base abierta con aliases, paquetes afectados y rangos de versiones.",
+    },
+    {
+        "id": "github_advisories",
+        "name": "GitHub Advisories",
+        "description": "Advisories GHSA y aliases (CVE, PYSEC, etc).",
+    },
+    {
+        "id": "cisa_kev",
+        "name": "CISA KEV",
+        "description": "Catalogo de vulnerabilidades explotadas en el mundo real.",
+    },
+    {
+        "id": "first_epss",
+        "name": "FIRST EPSS",
+        "description": "Score probabilistico de explotacion para CVE.",
+    },
+    {
+        "id": "snyk",
+        "name": "Snyk Vulnerability DB",
+        "description": "Contexto adicional por ecosistema y remediacion.",
+    },
+    {
+        "id": "vulners",
+        "name": "Vulners",
+        "description": "Motor de busqueda de inteligencia de vulnerabilidades.",
+    },
+]
 
 
 @app.route("/")
@@ -109,6 +168,43 @@ def _cache_set(cache_key: str, payload: dict[str, Any], raw: dict[str, Any] | No
         }
 
 
+def _intel_cache_get(cache_key: str) -> dict[str, Any] | None:
+    now = time.time()
+    with cache_lock:
+        entry = intel_cache.get(cache_key)
+        if not entry:
+            return None
+        if now - entry["created_at"] > INTEL_CACHE_TTL_SECONDS:
+            intel_cache.pop(cache_key, None)
+            return None
+        return entry["payload"]
+
+
+def _intel_cache_set(cache_key: str, payload: dict[str, Any]):
+    with cache_lock:
+        intel_cache[cache_key] = {
+            "created_at": time.time(),
+            "payload": payload,
+        }
+
+
+def _http_get_json(url: str, timeout_seconds: int = HTTP_TIMEOUT_SECONDS) -> dict[str, Any] | None:
+    request = Request(
+        url,
+        headers={
+            "Accept": "application/json",
+            "User-Agent": "ProyectoSSSLC-AnalisisOpenSource/1.0",
+        },
+    )
+    try:
+        with urlopen(request, timeout=timeout_seconds) as response:
+            data = response.read().decode("utf-8", errors="replace")
+            parsed = json.loads(data)
+            return parsed if isinstance(parsed, dict) else None
+    except (URLError, HTTPError, TimeoutError, json.JSONDecodeError):
+        return None
+
+
 def _runtime_path(filename: str) -> str:
     os.makedirs(RUNTIME_DIR, exist_ok=True)
     return os.path.join(RUNTIME_DIR, filename)
@@ -124,6 +220,567 @@ def _write_text_file(filename: str, content: str):
     path = _runtime_path(filename)
     with open(path, "w", encoding="utf-8") as file:
         file.write(content)
+
+
+def _detect_vulnerability_id_type(vulnerability_id: str) -> str:
+    normalized = vulnerability_id.strip().upper()
+    if CVE_PATTERN.match(normalized):
+        return "CVE"
+    if GHSA_PATTERN.match(normalized):
+        return "GHSA"
+    if PYSEC_PATTERN.match(normalized):
+        return "PYSEC"
+    return "GENERIC"
+
+
+def _build_vulnerability_references(vulnerability_id: str) -> tuple[str, list[dict[str, str]]]:
+    normalized = vulnerability_id.strip().upper()
+    query = quote_plus(normalized)
+    vuln_type = _detect_vulnerability_id_type(normalized)
+    nvd_url = (
+        f"https://nvd.nist.gov/vuln/detail/{normalized}"
+        if vuln_type == "CVE"
+        else f"https://nvd.nist.gov/vuln/search/results?query={query}&search_type=all"
+    )
+    mitre_url = (
+        f"https://www.cve.org/CVERecord?id={normalized}"
+        if vuln_type == "CVE"
+        else f"https://www.cve.org/SearchResults?query={query}"
+    )
+    osv_url = (
+        f"https://osv.dev/vulnerability/{normalized}"
+        if vuln_type in {"CVE", "GHSA", "PYSEC"}
+        else f"https://osv.dev/list?search={query}"
+    )
+    github_url = (
+        f"https://github.com/advisories/{normalized}"
+        if vuln_type == "GHSA"
+        else f"https://github.com/advisories?query={query}"
+    )
+    cisa_url = (
+        "https://www.cisa.gov/known-exploited-vulnerabilities-catalog"
+        f"?search_api_fulltext={query}"
+    )
+    epss_url = (
+        f"https://api.first.org/data/v1/epss?cve={normalized}"
+        if vuln_type == "CVE"
+        else f"https://www.first.org/epss/data_stats?search={query}"
+    )
+
+    references: list[dict[str, str]] = [
+        {
+            "database_id": "nvd",
+            "database_name": "NVD (NIST)",
+            "url": nvd_url,
+        },
+        {
+            "database_id": "mitre_cve",
+            "database_name": "MITRE CVE",
+            "url": mitre_url,
+        },
+        {
+            "database_id": "osv",
+            "database_name": "OSV.dev",
+            "url": osv_url,
+        },
+        {
+            "database_id": "github_advisories",
+            "database_name": "GitHub Advisories",
+            "url": github_url,
+        },
+        {
+            "database_id": "cisa_kev",
+            "database_name": "CISA KEV",
+            "url": cisa_url,
+        },
+        {
+            "database_id": "first_epss",
+            "database_name": "FIRST EPSS",
+            "url": epss_url,
+        },
+        {
+            "database_id": "snyk",
+            "database_name": "Snyk Vulnerability DB",
+            "url": f"https://security.snyk.io/vuln/?search={query}",
+        },
+        {
+            "database_id": "vulners",
+            "database_name": "Vulners",
+            "url": f"https://vulners.com/search?query={query}",
+        },
+    ]
+
+    return vuln_type, references
+
+
+def _extract_identifiers_from_text(text: str) -> list[str]:
+    found: set[str] = set()
+    for pattern in (CVE_SEARCH_PATTERN, GHSA_SEARCH_PATTERN, PYSEC_SEARCH_PATTERN):
+        for match in pattern.findall(text or ""):
+            found.add(str(match).upper())
+    return sorted(found)
+
+
+def _collect_vulnerability_identifiers(vulnerability: dict[str, Any]) -> list[str]:
+    candidates: set[str] = set()
+
+    for field_name in ("id", "name", "description", "url"):
+        value = vulnerability.get(field_name)
+        if isinstance(value, str) and value.strip():
+            for identifier in _extract_identifiers_from_text(value):
+                candidates.add(identifier)
+
+    for field_name in ("id", "name"):
+        value = vulnerability.get(field_name)
+        if isinstance(value, str):
+            normalized = value.strip().upper()
+            if normalized and _detect_vulnerability_id_type(normalized) != "GENERIC":
+                candidates.add(normalized)
+
+    if not candidates:
+        fallback = vulnerability.get("id") or vulnerability.get("name") or vulnerability.get("package")
+        if isinstance(fallback, str) and fallback.strip():
+            candidates.add(fallback.strip())
+
+    ordered = sorted(
+        candidates,
+        key=lambda item: (
+            0
+            if _detect_vulnerability_id_type(item) == "CVE"
+            else 1 if _detect_vulnerability_id_type(item) == "GHSA" else 2,
+            item,
+        ),
+    )
+    return ordered
+
+
+def _fetch_cisa_kev_index() -> dict[str, dict[str, Any]]:
+    now = time.time()
+    with cache_lock:
+        created_at = float(kev_cache.get("created_at", 0))
+        cached_set = kev_cache.get("set")
+        if now - created_at <= INTEL_CACHE_TTL_SECONDS and isinstance(cached_set, dict):
+            return cached_set
+
+    parsed = _http_get_json(
+        "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json",
+    )
+
+    kev_index: dict[str, dict[str, Any]] = {}
+    vulnerabilities = parsed.get("vulnerabilities", []) if isinstance(parsed, dict) else []
+    if isinstance(vulnerabilities, list):
+        for item in vulnerabilities:
+            if not isinstance(item, dict):
+                continue
+            cve_id = str(item.get("cveID", "")).strip().upper()
+            if not cve_id:
+                continue
+            kev_index[cve_id] = {
+                "date_added": item.get("dateAdded"),
+                "due_date": item.get("dueDate"),
+                "required_action": item.get("requiredAction"),
+                "known_ransomware_campaign_use": item.get("knownRansomwareCampaignUse"),
+            }
+
+    with cache_lock:
+        kev_cache["created_at"] = now
+        kev_cache["set"] = kev_index
+
+    return kev_index
+
+
+def _chunked(items: list[str], chunk_size: int) -> list[list[str]]:
+    if chunk_size <= 0:
+        return [items]
+    return [items[index : index + chunk_size] for index in range(0, len(items), chunk_size)]
+
+
+def _fetch_epss_scores(cve_ids: list[str]) -> dict[str, dict[str, Any]]:
+    results: dict[str, dict[str, Any]] = {}
+    if not cve_ids:
+        return results
+
+    unique_cves = sorted({cve.strip().upper() for cve in cve_ids if cve and cve.strip()})
+    if not unique_cves:
+        return results
+
+    for chunk in _chunked(unique_cves, 80):
+        joined = ",".join(chunk)
+        payload = _http_get_json(f"https://api.first.org/data/v1/epss?cve={quote_plus(joined)}")
+        data = payload.get("data", []) if isinstance(payload, dict) else []
+        if not isinstance(data, list):
+            continue
+
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            cve_id = str(item.get("cve", "")).strip().upper()
+            if not cve_id:
+                continue
+            try:
+                epss_value = float(item.get("epss")) if item.get("epss") is not None else None
+            except (TypeError, ValueError):
+                epss_value = None
+            try:
+                percentile = (
+                    float(item.get("percentile"))
+                    if item.get("percentile") is not None
+                    else None
+                )
+            except (TypeError, ValueError):
+                percentile = None
+
+            results[cve_id] = {
+                "score": epss_value,
+                "percentile": percentile,
+                "date": item.get("date"),
+            }
+
+    return results
+
+
+def _fetch_nvd_context(cve_id: str) -> dict[str, Any]:
+    cache_key = f"nvd:{cve_id}"
+    cached = _intel_cache_get(cache_key)
+    if cached:
+        return cached
+
+    payload = _http_get_json(
+        f"https://services.nvd.nist.gov/rest/json/cves/2.0?cveId={quote_plus(cve_id)}",
+    )
+    vulnerabilities = payload.get("vulnerabilities", []) if isinstance(payload, dict) else []
+
+    result: dict[str, Any] = {
+        "available": False,
+        "found": False,
+        "cvss_base_score": None,
+        "cvss_severity": None,
+        "published": None,
+        "last_modified": None,
+    }
+
+    if isinstance(vulnerabilities, list) and vulnerabilities:
+        first = vulnerabilities[0] if isinstance(vulnerabilities[0], dict) else {}
+        cve_block = first.get("cve", {}) if isinstance(first, dict) else {}
+        metrics = cve_block.get("metrics", {}) if isinstance(cve_block, dict) else {}
+        cvss_score = None
+        cvss_severity = None
+
+        for metric_key in ("cvssMetricV31", "cvssMetricV30", "cvssMetricV2"):
+            entries = metrics.get(metric_key, [])
+            if not isinstance(entries, list) or not entries:
+                continue
+            metric_item = entries[0] if isinstance(entries[0], dict) else {}
+            cvss_data = metric_item.get("cvssData", {}) if isinstance(metric_item, dict) else {}
+            score = cvss_data.get("baseScore")
+            severity = cvss_data.get("baseSeverity") or metric_item.get("baseSeverity")
+            if isinstance(score, (int, float)):
+                cvss_score = float(score)
+                cvss_severity = str(severity).lower() if severity else None
+                break
+
+        result = {
+            "available": True,
+            "found": True,
+            "cvss_base_score": cvss_score,
+            "cvss_severity": cvss_severity,
+            "published": cve_block.get("published"),
+            "last_modified": cve_block.get("lastModified"),
+        }
+
+    _intel_cache_set(cache_key, result)
+    return result
+
+
+def _fetch_osv_context(vulnerability_id: str) -> dict[str, Any]:
+    cache_key = f"osv:{vulnerability_id}"
+    cached = _intel_cache_get(cache_key)
+    if cached:
+        return cached
+
+    payload = _http_get_json(f"https://api.osv.dev/v1/vulns/{quote_plus(vulnerability_id)}")
+    if not isinstance(payload, dict) or not payload:
+        result = {
+            "available": False,
+            "found": False,
+            "summary": None,
+            "aliases": [],
+            "affected_packages": [],
+        }
+        _intel_cache_set(cache_key, result)
+        return result
+
+    aliases = payload.get("aliases", []) if isinstance(payload.get("aliases"), list) else []
+    affected_packages: list[str] = []
+    affected = payload.get("affected", []) if isinstance(payload.get("affected"), list) else []
+    for affected_item in affected:
+        if not isinstance(affected_item, dict):
+            continue
+        package = affected_item.get("package", {})
+        if not isinstance(package, dict):
+            continue
+        name = package.get("name")
+        ecosystem = package.get("ecosystem")
+        if isinstance(name, str) and name:
+            if isinstance(ecosystem, str) and ecosystem:
+                affected_packages.append(f"{ecosystem}:{name}")
+            else:
+                affected_packages.append(name)
+
+    result = {
+        "available": True,
+        "found": True,
+        "summary": payload.get("summary"),
+        "aliases": [str(alias).upper() for alias in aliases if isinstance(alias, str)],
+        "affected_packages": affected_packages[:8],
+    }
+    _intel_cache_set(cache_key, result)
+    return result
+
+
+def _compute_intel_score(
+    cisa_kev_listed: bool,
+    epss_score: float | None,
+    cvss_base_score: float | None,
+) -> tuple[int, str]:
+    score = 0
+
+    if cisa_kev_listed:
+        score += 50
+
+    if epss_score is not None:
+        if epss_score >= 0.9:
+            score += 30
+        elif epss_score >= 0.7:
+            score += 20
+        elif epss_score >= 0.3:
+            score += 10
+        elif epss_score >= 0.1:
+            score += 5
+
+    if cvss_base_score is not None:
+        if cvss_base_score >= 9.0:
+            score += 25
+        elif cvss_base_score >= 7.0:
+            score += 15
+        elif cvss_base_score >= 4.0:
+            score += 8
+        elif cvss_base_score > 0:
+            score += 4
+
+    bounded = min(100, score)
+    if bounded >= 80:
+        return bounded, "Crítico"
+    if bounded >= 60:
+        return bounded, "Alto"
+    if bounded >= 35:
+        return bounded, "Medio"
+    if bounded >= 15:
+        return bounded, "Bajo"
+    return bounded, "Informativo"
+
+
+def _build_identifier_intel(
+    identifier: str,
+    epss_scores: dict[str, dict[str, Any]],
+    kev_index: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    normalized = identifier.strip().upper()
+    detected_type, references = _build_vulnerability_references(normalized)
+
+    cisa_kev_data = kev_index.get(normalized) if detected_type == "CVE" else None
+    epss_data = epss_scores.get(normalized) if detected_type == "CVE" else None
+    nvd_data = _fetch_nvd_context(normalized) if detected_type == "CVE" else {
+        "available": None,
+        "found": None,
+        "cvss_base_score": None,
+        "cvss_severity": None,
+        "published": None,
+        "last_modified": None,
+    }
+    osv_data = (
+        _fetch_osv_context(normalized)
+        if detected_type in {"CVE", "GHSA", "PYSEC"}
+        else {
+            "available": None,
+            "found": None,
+            "summary": None,
+            "aliases": [],
+            "affected_packages": [],
+        }
+    )
+
+    epss_score = None
+    if isinstance(epss_data, dict):
+        raw_score = epss_data.get("score")
+        if isinstance(raw_score, (float, int)):
+            epss_score = float(raw_score)
+
+    cvss_base_score = nvd_data.get("cvss_base_score")
+    if not isinstance(cvss_base_score, (int, float)):
+        cvss_base_score = None
+
+    intel_score, intel_label = _compute_intel_score(
+        cisa_kev_listed=bool(cisa_kev_data),
+        epss_score=epss_score,
+        cvss_base_score=float(cvss_base_score) if cvss_base_score is not None else None,
+    )
+
+    return {
+        "primary_id": normalized,
+        "detected_type": detected_type,
+        "catalog_coverage": len(references),
+        "catalog_total": len(VULNERABILITY_DATABASES),
+        "references": references,
+        "intel_score": intel_score,
+        "intel_risk_level": intel_label,
+        "signals": {
+            "nvd": nvd_data,
+            "osv": osv_data,
+            "cisa_kev": {
+                "listed": bool(cisa_kev_data),
+                "details": cisa_kev_data if cisa_kev_data else None,
+            },
+            "first_epss": {
+                "score": epss_data.get("score") if isinstance(epss_data, dict) else None,
+                "percentile": epss_data.get("percentile") if isinstance(epss_data, dict) else None,
+                "date": epss_data.get("date") if isinstance(epss_data, dict) else None,
+            },
+        },
+    }
+
+
+def _build_intelligence_summary(vulnerabilities: list[dict[str, Any]]) -> dict[str, Any]:
+    total_vulnerabilities = len(vulnerabilities)
+    catalog_total = len(VULNERABILITY_DATABASES)
+    enriched = 0
+    full_catalog = 0
+    detected_types = {"CVE": 0, "GHSA": 0, "PYSEC": 0, "GENERIC": 0}
+    kev_count = 0
+    epss_scores: list[tuple[str, float]] = []
+    top_intel: tuple[str, int] = ("", -1)
+
+    for vulnerability in vulnerabilities:
+        intel = vulnerability.get("intel")
+        if not isinstance(intel, dict):
+            continue
+        enriched += 1
+
+        detected_type = str(intel.get("detected_type", "GENERIC")).upper()
+        detected_types[detected_type if detected_type in detected_types else "GENERIC"] += 1
+
+        if int(intel.get("catalog_coverage", 0)) >= catalog_total:
+            full_catalog += 1
+
+        signals = intel.get("signals", {}) if isinstance(intel.get("signals"), dict) else {}
+        cisa = signals.get("cisa_kev", {}) if isinstance(signals.get("cisa_kev"), dict) else {}
+        if bool(cisa.get("listed")):
+            kev_count += 1
+
+        epss = signals.get("first_epss", {}) if isinstance(signals.get("first_epss"), dict) else {}
+        score = epss.get("score")
+        primary_id = str(intel.get("primary_id", ""))
+        if isinstance(score, (int, float)):
+            epss_scores.append((primary_id, float(score)))
+
+        intel_score = intel.get("intel_score")
+        if isinstance(intel_score, int) and intel_score > top_intel[1]:
+            top_intel = (primary_id, intel_score)
+
+    average_epss = round(sum(score for _, score in epss_scores) / len(epss_scores), 4) if epss_scores else None
+    max_epss_item = max(epss_scores, key=lambda item: item[1]) if epss_scores else None
+
+    return {
+        "catalog_sources_total": catalog_total,
+        "vulnerabilities_enriched": enriched,
+        "full_catalog_matches": full_catalog,
+        "coverage_percent": round((enriched / total_vulnerabilities) * 100, 2) if total_vulnerabilities else 0,
+        "detected_ids": {
+            "cve": detected_types["CVE"],
+            "ghsa": detected_types["GHSA"],
+            "pysec": detected_types["PYSEC"],
+            "generic": detected_types["GENERIC"],
+        },
+        "known_exploited_count": kev_count,
+        "average_epss": average_epss,
+        "highest_epss": (
+            {"id": max_epss_item[0], "score": max_epss_item[1]}
+            if max_epss_item
+            else None
+        ),
+        "top_intel_score": (
+            {"id": top_intel[0], "score": top_intel[1]}
+            if top_intel[1] >= 0
+            else None
+        ),
+    }
+
+
+def _enrich_vulnerabilities_with_intelligence(vulnerabilities: list[dict[str, Any]]) -> dict[str, Any]:
+    if not vulnerabilities:
+        return _build_intelligence_summary(vulnerabilities)
+
+    plan: list[tuple[dict[str, Any], str, list[str]]] = []
+    unique_identifiers: set[str] = set()
+
+    for vulnerability in vulnerabilities:
+        identifiers = _collect_vulnerability_identifiers(vulnerability)
+        primary_identifier = identifiers[0] if identifiers else ""
+        if not primary_identifier:
+            continue
+        plan.append((vulnerability, primary_identifier, identifiers))
+        unique_identifiers.add(primary_identifier)
+
+    cve_ids = [
+        identifier.upper()
+        for identifier in unique_identifiers
+        if _detect_vulnerability_id_type(identifier) == "CVE"
+    ]
+    kev_index = _fetch_cisa_kev_index()
+    epss_scores = _fetch_epss_scores(cve_ids)
+
+    intel_by_identifier: dict[str, dict[str, Any]] = {}
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        futures = {
+            executor.submit(_build_identifier_intel, identifier, epss_scores, kev_index): identifier
+            for identifier in unique_identifiers
+        }
+        for future in as_completed(futures):
+            identifier = futures[future]
+            try:
+                intel_by_identifier[identifier] = future.result()
+            except Exception:
+                detected_type, references = _build_vulnerability_references(identifier)
+                intel_by_identifier[identifier] = {
+                    "primary_id": identifier.upper(),
+                    "detected_type": detected_type,
+                    "catalog_coverage": len(references),
+                    "catalog_total": len(VULNERABILITY_DATABASES),
+                    "references": references,
+                    "intel_score": 0,
+                    "intel_risk_level": "Informativo",
+                    "signals": {
+                        "nvd": None,
+                        "osv": None,
+                        "cisa_kev": {"listed": False, "details": None},
+                        "first_epss": {"score": None, "percentile": None, "date": None},
+                    },
+                }
+
+    for vulnerability, primary_identifier, identifiers in plan:
+        intel = dict(intel_by_identifier.get(primary_identifier, {}))
+        intel["aliases"] = [identifier.upper() for identifier in identifiers]
+        vulnerability["intel"] = intel
+
+        if not vulnerability.get("url"):
+            references = intel.get("references", [])
+            if isinstance(references, list) and references:
+                first_ref = references[0] if isinstance(references[0], dict) else {}
+                default_url = first_ref.get("url")
+                if isinstance(default_url, str):
+                    vulnerability["url"] = default_url
+
+    return _build_intelligence_summary(vulnerabilities)
 
 
 def _parse_json_payload(raw_text: str) -> dict[str, Any]:
@@ -535,7 +1192,9 @@ def _run_python_audit(requirements_text: str) -> tuple[dict[str, Any], dict[str,
         raise RuntimeError(details)
 
     vulnerabilities, dependencies_scanned = _parse_python_audit(raw)
+    intelligence_summary = _enrich_vulnerabilities_with_intelligence(vulnerabilities)
     summary = _build_summary(vulnerabilities, dependencies_scanned)
+    summary["intelligence"] = intelligence_summary
     recommendations = _generate_recommendations(vulnerabilities, "python")
 
     payload = {
@@ -543,6 +1202,7 @@ def _run_python_audit(requirements_text: str) -> tuple[dict[str, Any], dict[str,
         "scanned_at": _utc_now_iso(),
         "duration_ms": duration_ms,
         "summary": summary,
+        "intelligence_summary": intelligence_summary,
         "vulnerabilities": vulnerabilities,
         "recommendations": recommendations,
         "audit_mode": (
@@ -589,7 +1249,9 @@ def _run_npm_audit(package_json_text: str) -> tuple[dict[str, Any], dict[str, An
     raw = _parse_json_payload(raw_text)
 
     vulnerabilities, dependencies_scanned = _parse_npm_audit(raw)
+    intelligence_summary = _enrich_vulnerabilities_with_intelligence(vulnerabilities)
     summary = _build_summary(vulnerabilities, dependencies_scanned)
+    summary["intelligence"] = intelligence_summary
     recommendations = _generate_recommendations(vulnerabilities, "npm")
 
     payload = {
@@ -597,6 +1259,7 @@ def _run_npm_audit(package_json_text: str) -> tuple[dict[str, Any], dict[str, An
         "scanned_at": _utc_now_iso(),
         "duration_ms": duration_ms,
         "summary": summary,
+        "intelligence_summary": intelligence_summary,
         "vulnerabilities": vulnerabilities,
         "recommendations": recommendations,
     }
@@ -700,6 +1363,63 @@ def get_python_output():
             return jsonify(json.load(output_file))
     except json.JSONDecodeError as error:
         return jsonify({"error": f"Error al parsear python_output.json: {error}"}), 500
+
+
+@app.route("/api/vulnerability-databases", methods=["GET"])
+def get_vulnerability_databases():
+    return jsonify(
+        {
+            "total": len(VULNERABILITY_DATABASES),
+            "databases": VULNERABILITY_DATABASES,
+        }
+    )
+
+
+@app.route("/api/vulnerability/<path:vulnerability_id>/references", methods=["GET"])
+def get_vulnerability_references(vulnerability_id: str):
+    normalized = vulnerability_id.strip()
+    if not normalized:
+        return jsonify({"error": "Debes enviar un ID de vulnerabilidad."}), 400
+
+    vuln_type, references = _build_vulnerability_references(normalized)
+    return jsonify(
+        {
+            "query": normalized.upper(),
+            "detected_type": vuln_type,
+            "total_sources": len(references),
+            "references": references,
+        }
+    )
+
+
+@app.route("/api/vulnerability/references", methods=["POST"])
+def get_vulnerability_references_batch():
+    payload = request.get_json(silent=True) or {}
+    ids = payload.get("ids", [])
+
+    if not isinstance(ids, list) or not ids:
+        return jsonify({"error": "Debes enviar un arreglo 'ids' con al menos un valor."}), 400
+
+    result: dict[str, dict[str, object]] = {}
+    for raw_id in ids:
+        if not isinstance(raw_id, str):
+            continue
+
+        normalized = raw_id.strip()
+        if not normalized:
+            continue
+
+        vuln_type, references = _build_vulnerability_references(normalized)
+        result[normalized.upper()] = {
+            "detected_type": vuln_type,
+            "total_sources": len(references),
+            "references": references,
+        }
+
+    if not result:
+        return jsonify({"error": "No se recibieron IDs validos."}), 400
+
+    return jsonify({"count": len(result), "items": result})
 
 
 if __name__ == "__main__":

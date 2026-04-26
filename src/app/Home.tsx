@@ -1,4 +1,4 @@
-import { ChangeEvent, useMemo, useState } from "react";
+import { ChangeEvent, FormEvent, useEffect, useMemo, useState } from "react";
 import "./home.css";
 
 type Severity = "critical" | "high" | "moderate" | "low" | "info" | "unknown";
@@ -15,6 +15,21 @@ type Vulnerability = {
   fix_available?: boolean;
   description?: string;
   url?: string;
+  intel?: VulnerabilityIntel;
+};
+
+type VulnerabilityIntel = {
+  primary_id?: string;
+  detected_type?: string;
+  catalog_coverage?: number;
+  catalog_total?: number;
+  intel_score?: number;
+  intel_risk_level?: string;
+  references?: VulnerabilityReference[];
+  signals?: {
+    cisa_kev?: { listed?: boolean };
+    first_epss?: { score?: number | null };
+  };
 };
 
 type AuditSummary = {
@@ -41,9 +56,46 @@ type AuditResponse = {
   scanned_at: string;
   duration_ms: number;
   summary: AuditSummary;
+  intelligence_summary?: IntelligenceSummary;
   vulnerabilities: Vulnerability[];
   recommendations: Recommendation[];
   cached?: boolean;
+};
+
+type VulnerabilityDatabase = {
+  id: string;
+  name: string;
+  description: string;
+};
+
+type VulnerabilityReference = {
+  database_id: string;
+  database_name: string;
+  url: string;
+};
+
+type VulnerabilityIntelResponse = {
+  query: string;
+  detected_type: string;
+  total_sources: number;
+  references: VulnerabilityReference[];
+};
+
+type IntelligenceSummary = {
+  catalog_sources_total: number;
+  vulnerabilities_enriched: number;
+  full_catalog_matches: number;
+  coverage_percent: number;
+  detected_ids: {
+    cve: number;
+    ghsa: number;
+    pysec: number;
+    generic: number;
+  };
+  known_exploited_count: number;
+  average_epss: number | null;
+  highest_epss: { id: string; score: number } | null;
+  top_intel_score: { id: string; score: number } | null;
 };
 
 const severityOrder: Severity[] = [
@@ -72,6 +124,16 @@ const severityColors: Record<Severity, string> = {
   info: "#4f8ad9",
   unknown: "#72829f",
 };
+
+const CVE_REGEX = /CVE-\d{4}-\d{4,}/i;
+const GHSA_REGEX = /GHSA-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4}/i;
+const PYSEC_REGEX = /PYSEC-\d{4}-\d+/i;
+const LOADING_STEPS = [
+  "Validando el formato del archivo de dependencias...",
+  "Ejecutando motores de auditoria y recoleccion de hallazgos...",
+  "Normalizando severidades y consolidando vulnerabilidades...",
+  "Construyendo graficas y resumen ejecutivo del riesgo...",
+];
 
 function normalizeSeverity(value: string | undefined): Severity {
   if (!value) return "unknown";
@@ -147,6 +209,45 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
+function parseIntelligenceSummary(value: unknown): IntelligenceSummary | undefined {
+  if (!isRecord(value)) return undefined;
+
+  const detected = isRecord(value.detected_ids) ? value.detected_ids : {};
+  const highestEpss = isRecord(value.highest_epss) ? value.highest_epss : null;
+  const topIntel = isRecord(value.top_intel_score) ? value.top_intel_score : null;
+
+  return {
+    catalog_sources_total:
+      typeof value.catalog_sources_total === "number" ? value.catalog_sources_total : 0,
+    vulnerabilities_enriched:
+      typeof value.vulnerabilities_enriched === "number" ? value.vulnerabilities_enriched : 0,
+    full_catalog_matches:
+      typeof value.full_catalog_matches === "number" ? value.full_catalog_matches : 0,
+    coverage_percent: typeof value.coverage_percent === "number" ? value.coverage_percent : 0,
+    detected_ids: {
+      cve: typeof detected.cve === "number" ? detected.cve : 0,
+      ghsa: typeof detected.ghsa === "number" ? detected.ghsa : 0,
+      pysec: typeof detected.pysec === "number" ? detected.pysec : 0,
+      generic: typeof detected.generic === "number" ? detected.generic : 0,
+    },
+    known_exploited_count:
+      typeof value.known_exploited_count === "number" ? value.known_exploited_count : 0,
+    average_epss: typeof value.average_epss === "number" ? value.average_epss : null,
+    highest_epss:
+      highestEpss &&
+      typeof highestEpss.id === "string" &&
+      typeof highestEpss.score === "number"
+        ? { id: highestEpss.id, score: highestEpss.score }
+        : null,
+    top_intel_score:
+      topIntel &&
+      typeof topIntel.id === "string" &&
+      typeof topIntel.score === "number"
+        ? { id: topIntel.id, score: topIntel.score }
+        : null,
+  };
+}
+
 function parseApiResponse(payload: unknown): AuditResponse | null {
   if (Array.isArray(payload)) {
     return {
@@ -165,6 +266,9 @@ function parseApiResponse(payload: unknown): AuditResponse | null {
 
   const vulnerabilities = payload.vulnerabilities as Vulnerability[];
   const rawSummary = isRecord(payload.summary) ? payload.summary : {};
+  const intelligenceSummary =
+    parseIntelligenceSummary(payload.intelligence_summary) ||
+    parseIntelligenceSummary(rawSummary.intelligence);
   const severityMap = emptySeverityMap();
 
   severityOrder.forEach((severity) => {
@@ -195,6 +299,7 @@ function parseApiResponse(payload: unknown): AuditResponse | null {
       global_risk_score:
         typeof rawSummary.global_risk_score === "number" ? rawSummary.global_risk_score : 0,
     },
+    intelligence_summary: intelligenceSummary,
     vulnerabilities,
     recommendations: Array.isArray(payload.recommendations) ? payload.recommendations as Recommendation[] : [],
     cached: typeof payload.cached === "boolean" ? payload.cached : false,
@@ -236,6 +341,38 @@ function buildDonutGradient(bySeverity: Record<Severity, number>, total: number)
   return `conic-gradient(${segments.join(", ")})`;
 }
 
+function detectVulnerabilityIdType(value: string): string {
+  const normalized = value.trim().toUpperCase();
+  if (CVE_REGEX.test(normalized)) return "CVE";
+  if (GHSA_REGEX.test(normalized)) return "GHSA";
+  if (PYSEC_REGEX.test(normalized)) return "PYSEC";
+  return "GENERIC";
+}
+
+function extractVulnerabilityQuery(vulnerability: Vulnerability): string {
+  const fields = [
+    vulnerability.id,
+    vulnerability.name,
+    vulnerability.description,
+  ]
+    .filter(Boolean)
+    .map((item) => String(item));
+
+  for (const field of fields) {
+    const cveMatch = field.match(CVE_REGEX);
+    if (cveMatch?.[0]) return cveMatch[0].toUpperCase();
+
+    const ghsaMatch = field.match(GHSA_REGEX);
+    if (ghsaMatch?.[0]) return ghsaMatch[0].toUpperCase();
+
+    const pysecMatch = field.match(PYSEC_REGEX);
+    if (pysecMatch?.[0]) return pysecMatch[0].toUpperCase();
+  }
+
+  const fallback = vulnerability.id || vulnerability.name || vulnerability.package || "";
+  return String(fallback).trim();
+}
+
 function Home() {
   const [fileName, setFileName] = useState<string>("");
   const [audit, setAudit] = useState<AuditResponse | null>(null);
@@ -246,6 +383,31 @@ function Home() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [expandedDescriptions, setExpandedDescriptions] = useState<Set<string>>(new Set());
+  const [intelQuery, setIntelQuery] = useState("");
+  const [intelLoading, setIntelLoading] = useState(false);
+  const [intelError, setIntelError] = useState<string | null>(null);
+  const [intelResult, setIntelResult] = useState<VulnerabilityIntelResponse | null>(null);
+  const [vulnerabilityDatabases, setVulnerabilityDatabases] = useState<VulnerabilityDatabase[]>([]);
+  const [loadingStepIndex, setLoadingStepIndex] = useState(0);
+  const [loadingProgress, setLoadingProgress] = useState(8);
+
+  useEffect(() => {
+    const loadDatabases = async () => {
+      try {
+        const response = await fetch("/api/vulnerability-databases");
+        if (!response.ok) return;
+
+        const payload = (await response.json()) as { databases?: VulnerabilityDatabase[] };
+        if (Array.isArray(payload.databases)) {
+          setVulnerabilityDatabases(payload.databases);
+        }
+      } catch (loadError) {
+        console.error("No se pudo cargar el catalogo de bases", loadError);
+      }
+    };
+
+    void loadDatabases();
+  }, []);
 
   const bySeverity = useMemo(() => {
     if (!audit) return emptySeverityMap();
@@ -294,6 +456,74 @@ function Home() {
       .slice(0, 6);
   }, [audit]);
 
+  const intelSummary = useMemo(() => audit?.intelligence_summary, [audit]);
+
+  const intelTypeLabel = useMemo(() => {
+    if (!intelResult) return "N/A";
+    if (intelResult.detected_type === "CVE") return "CVE";
+    if (intelResult.detected_type === "GHSA") return "GHSA";
+    if (intelResult.detected_type === "PYSEC") return "PYSEC";
+    return "Busqueda general";
+  }, [intelResult]);
+
+  useEffect(() => {
+    if (!loading) {
+      setLoadingStepIndex(0);
+      setLoadingProgress(8);
+      return;
+    }
+
+    const stepTimer = window.setInterval(() => {
+      setLoadingStepIndex((prev) => (prev + 1) % LOADING_STEPS.length);
+    }, 1900);
+
+    const progressTimer = window.setInterval(() => {
+      setLoadingProgress((prev) => Math.min(prev + Math.random() * 9 + 2, 92));
+    }, 520);
+
+    return () => {
+      window.clearInterval(stepTimer);
+      window.clearInterval(progressTimer);
+    };
+  }, [loading]);
+
+  const fetchVulnerabilityReferences = async (rawQuery: string) => {
+    const normalized = rawQuery.trim();
+    if (!normalized) {
+      setIntelError("Ingresa un ID de vulnerabilidad para consultar fuentes.");
+      return;
+    }
+
+    setIntelLoading(true);
+    setIntelError(null);
+    setIntelResult(null);
+
+    try {
+      const response = await fetch(
+        `/api/vulnerability/${encodeURIComponent(normalized)}/references`,
+      );
+      const payload = (await response.json()) as VulnerabilityIntelResponse & { error?: string };
+
+      if (!response.ok) {
+        setIntelError(payload.error || "No se pudo consultar las bases de datos.");
+        return;
+      }
+
+      setIntelResult(payload);
+      setIntelQuery(payload.query || normalized);
+    } catch (requestError) {
+      console.error(requestError);
+      setIntelError("No se pudo conectar con el servicio de fuentes externas.");
+    } finally {
+      setIntelLoading(false);
+    }
+  };
+
+  const handleIntelSubmit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    await fetchVulnerabilityReferences(intelQuery);
+  };
+
   const handleFileChange = async (event: ChangeEvent<HTMLInputElement>) => {
     const selectedFile = event.target.files?.[0] || null;
     if (!selectedFile) return;
@@ -305,6 +535,8 @@ function Home() {
 
     setFileName(selectedFile.name);
     setLoading(true);
+    setLoadingStepIndex(0);
+    setLoadingProgress(10);
     setError(null);
     setAudit(null);
     setRawResults(null);
@@ -312,6 +544,8 @@ function Home() {
     setSearchTerm("");
     setSeverityFilter("all");
     setExpandedDescriptions(new Set());
+    setIntelError(null);
+    setIntelResult(null);
 
     const formData = new FormData();
     formData.append("file", selectedFile);
@@ -336,6 +570,12 @@ function Home() {
       }
 
       setAudit(parsed);
+      const suggestedQuery = parsed.vulnerabilities
+        .map((item) => extractVulnerabilityQuery(item))
+        .find((candidate) => candidate.length > 0);
+      if (suggestedQuery) {
+        setIntelQuery(suggestedQuery);
+      }
 
       if (selectedFile.name === "requirements.txt") {
         try {
@@ -361,6 +601,30 @@ function Home() {
     <div className="page-shell">
       <div className="ambient ambient-one" />
       <div className="ambient ambient-two" />
+      {loading && (
+        <div className="loading-overlay" role="status" aria-live="polite" aria-atomic="true">
+          <div className="loading-panel">
+            <div className="loading-orbit" aria-hidden="true">
+              <span />
+              <span />
+              <span />
+            </div>
+            <p className="loading-kicker">Escaneando {fileName || "dependencias"}</p>
+            <h2>Creando reporte inteligente</h2>
+            <p className="loading-step">{LOADING_STEPS[loadingStepIndex]}</p>
+            <div className="loading-progress-track">
+              <div
+                className="loading-progress-fill"
+                style={{ width: `${Math.round(loadingProgress)}%` }}
+              />
+            </div>
+            <div className="loading-progress-meta">
+              <span>{Math.round(loadingProgress)}%</span>
+              <span>Este proceso puede tardar algunos segundos</span>
+            </div>
+          </div>
+        </div>
+      )}
 
       <header className="hero">
         <p className="hero-kicker">Secure Dependency Observatory</p>
@@ -374,7 +638,10 @@ function Home() {
       <main className="content-grid">
         <section className="card upload-card">
           <div className="upload-top">
-            <label htmlFor="audit-file" className="upload-button">
+            <label
+              htmlFor="audit-file"
+              className={`upload-button${loading ? " disabled" : ""}`}
+            >
               Seleccionar archivo
             </label>
             <input
@@ -382,6 +649,7 @@ function Home() {
               type="file"
               className="hidden-input"
               accept=".txt,.json"
+              disabled={loading}
               onChange={handleFileChange}
             />
             <span className="file-pill">{fileName || "Sin archivo"}</span>
@@ -438,6 +706,29 @@ function Home() {
                 <p>Tiempo de analisis</p>
                 <h2>{(audit.duration_ms / 1000).toFixed(2)}s</h2>
               </article>
+
+              {intelSummary && (
+                <>
+                  <article className="card metric-card">
+                    <p>Cobertura del catalogo</p>
+                    <h2>{intelSummary.coverage_percent.toFixed(1)}%</h2>
+                  </article>
+
+                  <article className="card metric-card">
+                    <p>En CISA KEV</p>
+                    <h2>{intelSummary.known_exploited_count}</h2>
+                  </article>
+
+                  <article className="card metric-card">
+                    <p>EPSS promedio</p>
+                    <h2>
+                      {intelSummary.average_epss !== null
+                        ? intelSummary.average_epss.toFixed(3)
+                        : "N/A"}
+                    </h2>
+                  </article>
+                </>
+              )}
             </section>
 
             <section className="chart-grid">
@@ -526,6 +817,66 @@ function Home() {
               </section>
             )}
 
+            <section className="card intel-card">
+              <h3>Fuentes externas de vulnerabilidades</h3>
+              <p className="intel-subtitle">
+                Consulta CVE, GHSA o PYSEC para abrir multiples bases en un solo lugar.
+              </p>
+
+              <form className="intel-toolbar" onSubmit={handleIntelSubmit}>
+                <input
+                  value={intelQuery}
+                  onChange={(event) => setIntelQuery(event.target.value)}
+                  className="search-input"
+                  placeholder="Ejemplo: CVE-2024-3094 o GHSA-xxxx-xxxx-xxxx"
+                />
+                <button type="submit" className="ghost-button" disabled={intelLoading}>
+                  {intelLoading ? "Consultando..." : "Buscar fuentes"}
+                </button>
+              </form>
+
+              {intelError && <div className="state-banner error">{intelError}</div>}
+
+              {intelResult && !intelError && (
+                <div className="intel-kpis">
+                  <span>
+                    Tipo detectado: <strong>{intelTypeLabel}</strong>
+                  </span>
+                  <span>
+                    Consulta: <strong>{intelResult.query}</strong>
+                  </span>
+                  <span>
+                    Fuentes: <strong>{intelResult.total_sources}</strong>
+                  </span>
+                </div>
+              )}
+
+              <div className="intel-db-grid">
+                {vulnerabilityDatabases.map((database) => (
+                  <article key={database.id} className="intel-db-chip">
+                    <h4>{database.name}</h4>
+                    <p>{database.description}</p>
+                  </article>
+                ))}
+              </div>
+
+              {intelResult && intelResult.references.length > 0 && (
+                <div className="intel-ref-grid">
+                  {intelResult.references.map((reference) => (
+                    <article
+                      className="intel-ref-card"
+                      key={`${reference.database_id}:${reference.url}`}
+                    >
+                      <h4>{reference.database_name}</h4>
+                      <a href={reference.url} target="_blank" rel="noopener noreferrer">
+                        Abrir fuente
+                      </a>
+                    </article>
+                  ))}
+                </div>
+              )}
+            </section>
+
             <section className="card results-card">
               <div className="results-toolbar">
                 <input
@@ -570,6 +921,11 @@ function Home() {
                       const severity = normalizeSeverity(vulnerability.severity);
                       const vulnKey = `${vulnerability.id || vulnerability.name}-${index}`;
                       const isExpanded = expandedDescriptions.has(vulnKey);
+                      const lookupQuery = extractVulnerabilityQuery(vulnerability);
+                      const hasLookupQuery = lookupQuery.length > 0;
+                      const lookupType = hasLookupQuery
+                        ? detectVulnerabilityIdType(lookupQuery)
+                        : "GENERIC";
                       return (
                         <article className="vuln-card" key={vulnKey}>
                           <div className="vuln-top">
@@ -595,6 +951,17 @@ function Home() {
                               <a href={vulnerability.url} target="_blank" rel="noopener noreferrer">
                                 Referencia
                               </a>
+                            )}
+                            {hasLookupQuery && (
+                              <button
+                                className="intel-link-button"
+                                onClick={() => {
+                                  setIntelQuery(lookupQuery);
+                                  void fetchVulnerabilityReferences(lookupQuery);
+                                }}
+                              >
+                                Mas fuentes ({lookupType})
+                              </button>
                             )}
                             {vulnerability.description && (
                               <button 
