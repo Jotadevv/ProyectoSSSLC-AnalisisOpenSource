@@ -95,7 +95,7 @@ if __name__ == "__main__":
         print("Auditoría completada exitosamente")
     else:
         print("Error en la auditoría")
-        sys.exit(1)import subprocess
+        sys.exit(1)
 import json
 import os
 import sys
