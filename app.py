@@ -13,7 +13,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Any
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlparse
 from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
 
@@ -27,6 +27,12 @@ CACHE_TTL_SECONDS = 300
 INTEL_CACHE_TTL_SECONDS = 3600
 COMMAND_TIMEOUT_SECONDS = 240
 HTTP_TIMEOUT_SECONDS = 6
+ALLOWED_INTEL_HOSTS = {
+    "www.cisa.gov",
+    "services.nvd.nist.gov",
+    "api.osv.dev",
+    "api.first.org",
+}
 SEVERITY_KEYS = ["critical", "high", "moderate", "low", "info", "unknown"]
 SEVERITY_WEIGHT = {
     "critical": 5,
@@ -189,6 +195,10 @@ def _intel_cache_set(cache_key: str, payload: dict[str, Any]):
 
 
 def _http_get_json(url: str, timeout_seconds: int = HTTP_TIMEOUT_SECONDS) -> dict[str, Any] | None:
+    parsed_url = urlparse(url)
+    if parsed_url.scheme != "https" or parsed_url.hostname not in ALLOWED_INTEL_HOSTS:
+        return None
+
     request = Request(
         url,
         headers={
@@ -197,7 +207,7 @@ def _http_get_json(url: str, timeout_seconds: int = HTTP_TIMEOUT_SECONDS) -> dic
         },
     )
     try:
-        with urlopen(request, timeout=timeout_seconds) as response:
+        with urlopen(request, timeout=timeout_seconds) as response:  # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
             data = response.read().decode("utf-8", errors="replace")
             parsed = json.loads(data)
             return parsed if isinstance(parsed, dict) else None
@@ -1423,4 +1433,5 @@ def get_vulnerability_references_batch():
 
 
 if __name__ == "__main__":
-    app.run(debug=True, port=8000)
+    debug_mode = os.getenv("FLASK_DEBUG", "").strip().lower() in {"1", "true", "yes", "on"}
+    app.run(debug=debug_mode, port=8000)
